@@ -1,0 +1,7 @@
+# directories
+.venv
+__pycache__
+checkpoints
+
+# specific files
+venv.bash
