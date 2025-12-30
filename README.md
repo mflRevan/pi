@@ -1,4 +1,4 @@
-# Resonant Interference Network (RIN)
+# The Resonant Interference Network (RIN)
 
 A novel neural network architecture that treats information as continuous interference fields of complex waveforms, using harmonic resonance instead of attention mechanisms.
 
