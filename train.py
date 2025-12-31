@@ -19,11 +19,14 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 
+# Disable tokenizer parallelism warning
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # Transformers for tokenizer and datasets
 from transformers import GPT2Tokenizer, GPT2TokenizerFast
@@ -126,7 +129,7 @@ def train_epoch(
         batch = batch.to(device)
         
         # Forward pass with mixed precision
-        with autocast(enabled=config.training.use_amp):
+        with autocast(device_type="cuda", enabled=config.training.use_amp):
             loss, outputs = model.compute_loss(batch)
             loss = loss / config.training.gradient_accumulation_steps
         
@@ -194,7 +197,7 @@ def evaluate(
     for batch in dataloader:
         batch = batch.to(device)
         
-        with autocast(enabled=config.training.use_amp):
+        with autocast(device_type="cuda", enabled=config.training.use_amp):
             loss, outputs = model.compute_loss(batch)
         
         total_loss += loss.item() * batch.shape[0] * (batch.shape[1] - 1)
@@ -305,11 +308,13 @@ def main(config: Optional[RINConfig] = None):
         }
     
     # Create datasets
+    # Use model's max_seq_len to ensure data fits the model
     train_texts = dataset["train"]["text"] if isinstance(dataset, dict) else dataset["train"]["text"]
     val_texts = dataset["validation"]["text"] if isinstance(dataset, dict) else dataset["validation"]["text"]
+    seq_length = config.model.max_seq_len
     
-    train_dataset = TextDataset(train_texts, tokenizer, config.data.max_length)
-    val_dataset = TextDataset(val_texts, tokenizer, config.data.max_length)
+    train_dataset = TextDataset(train_texts, tokenizer, seq_length)
+    val_dataset = TextDataset(val_texts, tokenizer, seq_length)
     
     # Create dataloaders
     train_loader = DataLoader(
@@ -373,7 +378,7 @@ def main(config: Optional[RINConfig] = None):
     scheduler = get_lr_scheduler(optimizer, config.training, total_steps)
     
     # Initialize scaler for mixed precision
-    scaler = GradScaler(enabled=config.training.use_amp)
+    scaler = GradScaler("cuda", enabled=config.training.use_amp)
     
     # Checkpoint directory
     checkpoint_dir = Path(config.training.checkpoint_dir) / config.experiment_name
