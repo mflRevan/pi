@@ -1,242 +1,303 @@
 """
-Resonant Interference Network (RIN) Model
+Resonant Interference Network (RIN) - Euler's Formula Edition
 
-A complete language model using harmonic resonance instead of attention.
-Uses GPT-2 tokenizer and learns embeddings from scratch.
+The most beautiful neural network architecture in existence, combining:
+    π  - The circle constant (sin/cos periodicity)
+    e  - Euler's number (natural exponential)
+    i  - The imaginary unit (complex plane)
+    φ  - The golden ratio (maximally irrational timestep)
+    0,1 - The fundamental binary (unit circle bounds)
 
-Architecture:
-    Token IDs -> Embedding -> SinLayers -> Output Projection -> Logits
+EULER'S FORMULA: e^(iθ) = cos(θ) + i·sin(θ)
 
-The model "hears" meaning in the data's melody through phase alignment
-rather than calculating it through massive matrix pairings.
+KEY INSIGHT: By decomposing into real (cos) and imaginary (sin) parts,
+every neuron becomes a point on the unit circle with CONSTANT gradient:
+    |d/dθ (cos θ)|² + |d/dθ (sin θ)|² = sin²θ + cos²θ = 1
+
+This eliminates vanishing gradients at peaks and valleys - the network
+can learn everywhere with equal capability.
+
+CORE FORMULAS:
+    # Hidden state transformation
+    θ = (h_real + h_imag) / (1 + |w|) + b + t·φ
+    h_real_new = cos(θ)
+    h_imag_new = sin(θ)
+    
+    # Resonant layer computation  
+    θ = W·x + b + t·φ
+    output = W_real @ cos(θ) + W_imag @ sin(θ)
+
+Where φ ≈ 1.618 (golden ratio) is the most irrational number,
+providing maximum resistance to resonance disasters (KAM theory).
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Tuple
 
-from .layers import SinLayer, ResonantBlock, MultiResonantLayer
+from .lut import SinLUT, get_global_lut
+
+# Golden ratio - maximally irrational timestep scaling
+# From KAM theory: maximally irrational = maximally stable
+PHI = (1 + math.sqrt(5)) / 2  # ≈ 1.618033988749895
 
 
-class RINModel(nn.Module):
+class ResonantLayer(nn.Module):
     """
-    Resonant Interference Network for Language Modeling.
+    Resonant layer using Euler's formula for unit-circle computation.
     
-    A novel architecture that replaces attention with harmonic resonance.
-    Uses sin-based neurons with STDP-like learning for temporal patterns.
+    Each neuron computes a phasor on the complex plane:
+        θ = W·x + b + t·φ
+        real = cos(θ)  - x-coordinate on unit circle
+        imag = sin(θ)  - y-coordinate on unit circle
+        
+    Separate projections for real and imaginary parts allow the network
+    to learn arbitrary phase relationships:
+        output = W_real @ real + W_imag @ imag
     
-    Args:
-        vocab_size: Size of vocabulary (default: GPT-2's 50257)
-        embed_dim: Embedding dimension
-        hidden_dim: Hidden dimension for resonant layers
-        num_layers: Number of resonant blocks
-        num_heads: Number of resonant heads per multi-head layer
-        neurons_per_head: Neurons per head
-        max_seq_len: Maximum sequence length (for positional encoding)
-        dropout: Dropout rate
-        lut_resolution: Sin LUT resolution
-        use_multi_head: Whether to use multi-head resonance
+    This is mathematically equivalent to learning magnitude and phase,
+    but with gradient magnitude 1 EVERYWHERE on the circle.
     """
     
     def __init__(
         self,
-        vocab_size: int = 50257,  # GPT-2 vocab size
-        embed_dim: int = 256,
-        hidden_dim: int = 512,
-        num_layers: int = 1,
-        num_heads: int = 4,
-        neurons_per_head: int = 128,
-        max_seq_len: int = 1024,
-        dropout: float = 0.1,
-        lut_resolution: int = 512,
-        use_multi_head: bool = True,
+        d_model: int,
+        num_neurons: int,
+        lut_resolution: int = 4096,
+        use_swish: bool = True,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_neurons = num_neurons
+        self.use_swish = use_swish
+        
+        # Input weights: compute phase θ = W·x + b
+        self.W = nn.Parameter(torch.randn(num_neurons, d_model) * 0.02)
+        self.bias = nn.Parameter(torch.zeros(num_neurons))
+        
+        # Separate output projections for real (cos) and imaginary (sin) parts
+        # This allows learning arbitrary phase relationships
+        self.proj_real = nn.Linear(num_neurons, d_model, bias=False)
+        self.proj_imag = nn.Linear(num_neurons, d_model, bias=False)
+        
+        self.lut_resolution = lut_resolution
+        self._lut = None
+    
+    def _get_lut(self, device):
+        if self._lut is None or self._lut.sin_table.device != device:
+            self._lut = get_global_lut(self.lut_resolution, device)
+        return self._lut
+    
+    def forward(self, x: torch.Tensor, t: float) -> torch.Tensor:
+        """
+        Args:
+            x: Input (batch, d_model)
+            t: Timestep (already scaled by φ)
+            
+        Returns:
+            Output (batch, d_model)
+        """
+        lut = self._get_lut(x.device)
+        
+        # Compute phase: θ = W·x + b + t
+        theta = x @ self.W.T + self.bias + t
+        
+        # Euler decomposition: e^(iθ) = cos(θ) + i·sin(θ)
+        # Single index computation for both
+        sin_theta, cos_theta = lut.lookup_sin_cos(theta)
+        
+        # Separate projections - network learns optimal phase relationships
+        output = self.proj_real(cos_theta) + self.proj_imag(sin_theta)
+        
+        # Optional swish activation for non-linearity
+        if self.use_swish:
+            output = F.silu(output)
+        
+        return output
+
+
+class RINModel(nn.Module):
+    """
+    Resonant Interference Network - Euler's Formula Edition
+    
+    A neural network where every neuron is a point on the unit circle,
+    using Euler's beautiful identity: e^(iθ) = cos(θ) + i·sin(θ)
+    
+    The hidden state is a complex number (h_real, h_imag) that rotates
+    on the unit circle. This gives:
+    1. Constant gradient magnitude (no vanishing gradients)
+    2. Natural periodicity (perfect for learning patterns)
+    3. Golden ratio timesteps (maximum irrationality = stability)
+    
+    Args:
+        vocab_size: Vocabulary size
+        d_model: Model dimension (embedding is 2*d_model for w,b pairs)
+        num_layers: Number of resonant processing layers
+        num_neurons: Neurons per layer  
+        lut_resolution: Sin/cos lookup table resolution
+        use_swish: Whether to apply swish activation after resonant layers
+    """
+    
+    def __init__(
+        self,
+        vocab_size: int = 50257,
+        d_model: int = 128,
+        num_layers: int = 2,
+        num_neurons: int = 256,
+        lut_resolution: int = 4096,
+        use_swish: bool = True,
     ):
         super().__init__()
         
         self.vocab_size = vocab_size
-        self.embed_dim = embed_dim
-        self.hidden_dim = hidden_dim
-        self.max_seq_len = max_seq_len
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_neurons = num_neurons
+        self.lut_resolution = lut_resolution
+        self.use_swish = use_swish
         
-        # Token embeddings (learned from scratch, just like transformers)
-        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        # Token embeddings: 2*d_model for (w, b) pairs
+        # w = wavelength control, b = phase offset
+        self.token_embedding = nn.Embedding(vocab_size, 2 * d_model)
         
-        # We don't use traditional positional encoding!
-        # The timestep t in sin(wx + b + t) naturally encodes position
-        # But we can optionally add learnable positional embeddings
-        self.use_pos_embed = False  # Set to True to add positional embeddings
-        if self.use_pos_embed:
-            self.pos_embedding = nn.Embedding(max_seq_len, embed_dim)
+        # Resonant layers with Euler computation
+        self.layers = nn.ModuleList([
+            ResonantLayer(d_model, num_neurons, lut_resolution, use_swish=use_swish)
+            for _ in range(num_layers)
+        ])
         
-        # Embedding dropout
-        self.embed_dropout = nn.Dropout(dropout)
+        # Output projection
+        self.output_proj = nn.Linear(d_model, vocab_size, bias=False)
         
-        # Resonant layers
-        self.layers = nn.ModuleList()
-        
-        if use_multi_head:
-            # Multi-head resonance (richer representation)
-            for i in range(num_layers):
-                layer_input_dim = embed_dim if i == 0 else embed_dim
-                self.layers.append(
-                    MultiResonantLayer(
-                        input_dim=layer_input_dim,
-                        num_heads=num_heads,
-                        neurons_per_head=neurons_per_head,
-                        output_dim=embed_dim,
-                    )
-                )
-        else:
-            # Single resonant block per layer
-            for i in range(num_layers):
-                layer_input_dim = embed_dim if i == 0 else embed_dim
-                self.layers.append(
-                    ResonantBlock(
-                        input_dim=layer_input_dim,
-                        hidden_dim=hidden_dim,
-                        output_dim=embed_dim,
-                        use_layer_norm=True,
-                        use_gate=True,  # Dendritic gating
-                        lut_resolution=lut_resolution,
-                    )
-                )
-        
-        # Layer norm before output
-        self.final_norm = nn.LayerNorm(embed_dim)
-        
-        # Output projection to vocabulary
-        self.output_proj = nn.Linear(embed_dim, vocab_size, bias=False)
-        
-        # Tie weights between embedding and output (common practice)
-        self.output_proj.weight = self.token_embedding.weight
-        
-        # Initialize weights
+        self._lut = None
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights with small values for stability."""
-        # Token embeddings: normal distribution
-        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.token_embedding.weight, std=0.02)
+        nn.init.normal_(self.output_proj.weight, std=0.02)
+        # Scale down for stable initial transformations
+        with torch.no_grad():
+            self.token_embedding.weight.mul_(0.5)
+    
+    def _get_lut(self, device):
+        if self._lut is None or self._lut.sin_table.device != device:
+            self._lut = get_global_lut(self.lut_resolution, device)
+        return self._lut
+    
+    def init_hidden(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Initialize hidden state as (real, imag) pair.
+        Both start at zero - the origin, ready to rotate onto the unit circle.
+        """
+        h_real = torch.zeros(batch_size, self.d_model, device=device)
+        h_imag = torch.zeros(batch_size, self.d_model, device=device)
+        return h_real, h_imag
+    
+    def euler_transform(
+        self,
+        h_real: torch.Tensor,
+        h_imag: torch.Tensor,
+        w: torch.Tensor,
+        b: torch.Tensor,
+        t: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply Euler-based hidden state transformation.
         
-        # Position embeddings if used
-        if self.use_pos_embed:
-            nn.init.normal_(self.pos_embedding.weight, mean=0.0, std=0.02)
+        θ = (h_real + h_imag) / (1 + |w|) + b + t·φ
+        h_real_new = cos(θ)
+        h_imag_new = sin(θ)
+        
+        The wavelength (1 + |w|) controls oscillation speed.
+        Higher wavelength = slower rotation = more stable patterns.
+        """
+        lut = self._get_lut(h_real.device)
+        
+        # Combine previous state for phase computation
+        h_combined = h_real + h_imag
+        
+        # Wavelength formula with golden ratio timestep
+        wavelength = 1.0 + w.abs()
+        theta = h_combined / wavelength + b + t * PHI
+        
+        # Euler decomposition onto unit circle
+        h_imag_new, h_real_new = lut.lookup_sin_cos(theta)
+        
+        return h_real_new, h_imag_new
     
     def forward(
         self,
         input_ids: torch.Tensor,
-        timesteps: Optional[torch.Tensor] = None,
-        return_embeddings: bool = False,
-    ) -> Dict[str, torch.Tensor]:
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        t_start: int = 0,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward pass through the RIN model.
+        Full sequence forward pass with Euler-based computation.
         
         Args:
             input_ids: Token IDs (batch, seq_len)
-            timesteps: Optional custom timesteps (seq_len,)
-            return_embeddings: Whether to return intermediate embeddings
+            hidden: Initial (h_real, h_imag) or None
+            t_start: Starting timestep
             
         Returns:
-            Dictionary with:
-                - logits: Output logits (batch, seq_len, vocab_size)
-                - embeddings: Token embeddings (if return_embeddings=True)
-                - hidden_states: Final hidden states
+            logits: (batch, seq_len, vocab_size)
+            final_hidden: (h_real, h_imag)
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         
-        # Check sequence length
-        if seq_len > self.max_seq_len:
-            raise ValueError(
-                f"Sequence length {seq_len} exceeds maximum {self.max_seq_len}"
-            )
+        if hidden is None:
+            h_real, h_imag = self.init_hidden(batch_size, device)
+        else:
+            h_real, h_imag = hidden
         
-        # Get token embeddings
-        x = self.token_embedding(input_ids)  # (batch, seq_len, embed_dim)
+        # Get all embeddings at once
+        embeddings = self.token_embedding(input_ids)
+        w_emb = embeddings[:, :, :self.d_model]
+        b_emb = embeddings[:, :, self.d_model:]
         
-        # Add positional embeddings if used
-        if self.use_pos_embed:
-            positions = torch.arange(seq_len, device=device)
-            x = x + self.pos_embedding(positions)
+        all_logits = []
         
-        x = self.embed_dropout(x)
+        for t in range(seq_len):
+            w_t = w_emb[:, t, :]
+            b_t = b_emb[:, t, :]
+            t_val = float(t_start + t)
+            
+            # Euler-based hidden state transformation
+            h_real, h_imag = self.euler_transform(h_real, h_imag, w_t, b_t, t_val)
+            
+            # Combine for layer processing
+            x = h_real + h_imag
+            
+            # Process through resonant layers with residual connections
+            for layer in self.layers:
+                x = x + layer(x, t_val * PHI)
+            
+            logits = self.output_proj(x)
+            all_logits.append(logits)
         
-        # Store embeddings for return
-        embeddings = x if return_embeddings else None
-        
-        # Create timesteps for resonant layers
-        if timesteps is None:
-            # Default: linear timesteps representing position
-            # Scale to reasonable range for sin oscillations
-            timesteps = torch.arange(seq_len, dtype=x.dtype, device=device)
-            # Optional: scale timesteps for better frequency resolution
-            # timesteps = timesteps * 0.1
-        
-        # Pass through resonant layers
-        for layer in self.layers:
-            x = x + layer(x, timesteps)  # Residual connection
-        
-        # Final normalization
-        hidden_states = self.final_norm(x)
-        
-        # Project to vocabulary
-        logits = self.output_proj(hidden_states)
-        
-        result = {
-            "logits": logits,
-            "hidden_states": hidden_states,
-        }
-        
-        if return_embeddings:
-            result["embeddings"] = embeddings
-        
-        return result
+        return torch.stack(all_logits, dim=1), (h_real, h_imag)
     
     def compute_loss(
         self,
         input_ids: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        timesteps: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Compute language modeling loss.
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        t_start: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Compute next-token prediction loss."""
+        logits, hidden = self.forward(input_ids, hidden, t_start)
         
-        For causal LM: predict next token at each position.
-        Labels are shifted input_ids (standard practice).
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
         
-        Args:
-            input_ids: Input token IDs (batch, seq_len)
-            labels: Target token IDs (batch, seq_len) or None to auto-shift
-            timesteps: Optional timesteps
-            
-        Returns:
-            Tuple of (loss, output_dict)
-        """
-        # Forward pass
-        outputs = self.forward(input_ids, timesteps)
-        logits = outputs["logits"]
-        
-        # Prepare labels (shift for causal LM)
-        if labels is None:
-            # Auto-shift: predict next token
-            # Input: [t0, t1, t2, t3] -> Predict: [t1, t2, t3, t4]
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = input_ids[:, 1:].contiguous()
-        else:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-        
-        # Flatten for cross entropy
         loss = F.cross_entropy(
             shift_logits.view(-1, self.vocab_size),
             shift_labels.view(-1),
-            ignore_index=-100,  # Ignore padding
         )
         
-        outputs["loss"] = loss
-        return loss, outputs
+        return loss, logits, hidden
     
     @torch.no_grad()
     def generate(
@@ -245,150 +306,78 @@ class RINModel(nn.Module):
         max_new_tokens: int = 50,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
-        top_p: Optional[float] = None,
     ) -> torch.Tensor:
-        """
-        Generate new tokens autoregressively.
-        
-        Args:
-            input_ids: Starting token IDs (batch, seq_len)
-            max_new_tokens: Maximum tokens to generate
-            temperature: Sampling temperature
-            top_k: Top-k sampling
-            top_p: Nucleus sampling threshold
-            
-        Returns:
-            Generated token IDs (batch, seq_len + max_new_tokens)
-        """
+        """Generate tokens autoregressively."""
         self.eval()
+        device = input_ids.device
+        batch_size = input_ids.shape[0]
+        lut = self._get_lut(device)
         
+        h_real, h_imag = self.init_hidden(batch_size, device)
+        
+        # Process prompt
+        embeddings = self.token_embedding(input_ids)
+        w_emb = embeddings[:, :, :self.d_model]
+        b_emb = embeddings[:, :, self.d_model:]
+        
+        t = 0
+        for i in range(input_ids.shape[1]):
+            h_real, h_imag = self.euler_transform(
+                h_real, h_imag, w_emb[:, i, :], b_emb[:, i, :], float(t)
+            )
+            t += 1
+        
+        # Get initial logits
+        x = h_real + h_imag
+        for layer in self.layers:
+            x = x + layer(x, float(t - 1) * PHI)
+        logits = self.output_proj(x)
+        
+        # Generate
+        generated = input_ids
         for _ in range(max_new_tokens):
-            # Truncate if needed
-            idx_cond = input_ids
-            if input_ids.shape[1] > self.max_seq_len:
-                idx_cond = input_ids[:, -self.max_seq_len:]
-            
-            # Forward pass
-            outputs = self.forward(idx_cond)
-            logits = outputs["logits"][:, -1, :]  # Last position
-            
-            # Apply temperature
             if temperature != 1.0:
                 logits = logits / temperature
             
-            # Apply top-k
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float('-inf')
             
-            # Apply top-p (nucleus)
-            if top_p is not None:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-                sorted_indices_to_remove[:, 0] = 0
-                indices_to_remove = sorted_indices_to_remove.scatter(
-                    1, sorted_indices, sorted_indices_to_remove
-                )
-                logits[indices_to_remove] = float('-inf')
-            
-            # Sample
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+            generated = torch.cat([generated, next_token], dim=1)
             
-            # Append
-            input_ids = torch.cat([input_ids, next_token], dim=1)
+            # Update hidden state
+            emb = self.token_embedding(next_token.squeeze(-1))
+            w_t = emb[:, :self.d_model]
+            b_t = emb[:, self.d_model:]
+            h_real, h_imag = self.euler_transform(h_real, h_imag, w_t, b_t, float(t))
+            
+            # Get logits
+            x = h_real + h_imag
+            for layer in self.layers:
+                x = x + layer(x, float(t) * PHI)
+            logits = self.output_proj(x)
+            t += 1
         
-        return input_ids
+        return generated
     
-    def get_num_params(self, non_embedding: bool = True) -> int:
-        """Get number of parameters."""
-        n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.token_embedding.weight.numel()
-        return n_params
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
     
     def __repr__(self) -> str:
         return (
             f"RINModel(\n"
             f"  vocab_size={self.vocab_size},\n"
-            f"  embed_dim={self.embed_dim},\n"
-            f"  hidden_dim={self.hidden_dim},\n"
-            f"  num_layers={len(self.layers)},\n"
-            f"  max_seq_len={self.max_seq_len},\n"
+            f"  d_model={self.d_model},\n"
+            f"  num_layers={self.num_layers},\n"
+            f"  num_neurons={self.num_neurons},\n"
+            f"  use_swish={self.use_swish},\n"
+            f"  φ={PHI:.6f} (golden ratio),\n"
             f"  params={self.get_num_params():,}\n"
             f")"
         )
 
 
-class RINForSequenceClassification(nn.Module):
-    """
-    RIN model with a classification head.
-    
-    Can be used for sentiment analysis, text classification, etc.
-    """
-    
-    def __init__(
-        self,
-        num_labels: int,
-        vocab_size: int = 50257,
-        embed_dim: int = 256,
-        hidden_dim: int = 512,
-        num_layers: int = 1,
-        **kwargs
-    ):
-        super().__init__()
-        
-        self.num_labels = num_labels
-        
-        # Base model
-        self.rin = RINModel(
-            vocab_size=vocab_size,
-            embed_dim=embed_dim,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            **kwargs
-        )
-        
-        # Classification head
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.1),
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(embed_dim, num_labels),
-        )
-    
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass for classification.
-        
-        Uses mean pooling over sequence for classification.
-        """
-        outputs = self.rin(input_ids, return_embeddings=True)
-        hidden_states = outputs["hidden_states"]
-        
-        # Pool: mean over sequence (or use last token)
-        if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1).float()
-            pooled = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1)
-        else:
-            pooled = hidden_states.mean(dim=1)
-        
-        # Classify
-        logits = self.classifier(pooled)
-        
-        result = {"logits": logits, "hidden_states": hidden_states}
-        
-        # Compute loss if labels provided
-        if labels is not None:
-            loss = F.cross_entropy(logits, labels)
-            result["loss"] = loss
-        
-        return result
+# Export golden ratio for external use
+GOLDEN_RATIO = PHI

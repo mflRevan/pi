@@ -2,6 +2,8 @@
 .venv
 __pycache__
 checkpoints
+results
+data
 
 # specific files
 venv.bash

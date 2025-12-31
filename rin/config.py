@@ -28,7 +28,7 @@ class ModelConfig:
     max_seq_len: int = 512
     
     # Regularization
-    dropout: float = 0.1
+    dropout: float = 0.0
     
     # LUT configuration
     lut_resolution: int = 512
@@ -62,7 +62,7 @@ class TrainingConfig:
     
     # Optimization
     optimizer: str = "adamw"  # "adamw", "adam", "sgd"
-    betas: tuple = (0.9, 0.95)
+    betas: tuple = (0.9, 0.999)
     eps: float = 1e-8
     
     # Mixed precision
