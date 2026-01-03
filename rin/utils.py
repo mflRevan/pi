@@ -5,6 +5,7 @@ Includes:
 - Visualization tools
 - Analysis functions
 - Helper utilities
+- Time wrapping for periodic networks
 """
 
 import torch
@@ -12,6 +13,43 @@ import torch.nn as nn
 import numpy as np
 import math
 from typing import Optional, Dict, List, Tuple, Any
+
+
+TWO_PI = 2 * math.pi
+
+
+def wrap_time_periodic(t: torch.Tensor) -> torch.Tensor:
+    """
+    Wrap time to [0, 2π) with detached modulo for gradient flow.
+    
+    The key insight: since we use periodic functions (sin/cos via Euler's formula),
+    t mod 2π gives identical forward values AND gradients as unwrapped t.
+    
+    By detaching the modulo operation:
+    - Forward: sees t mod 2π (bounded, no numerical issues at large t)
+    - Backward: sees original t (gradients flow through as if no modulo)
+    
+    This works because:
+    - sin(t) = sin(t mod 2π) and d/dt sin(t) = cos(t) = cos(t mod 2π)
+    - The periodic structure means "direction" is relative, not absolute
+    - Golden ratio timescale avoids standing waves, so model learns relative flow
+    
+    Args:
+        t: Time tensor (any shape), already scaled by φ (golden ratio)
+        
+    Returns:
+        Time wrapped to [0, 2π) with gradient passthrough
+    """
+    # Compute wrapped value
+    t_wrapped = torch.fmod(t, TWO_PI)
+    # Handle negative values
+    t_wrapped = torch.where(t_wrapped < 0, t_wrapped + TWO_PI, t_wrapped)
+    
+    # Detach the modulo: gradient flows through t, not through the modulo op
+    # This is: t_wrapped_detached = t + (t_wrapped - t).detach()
+    # Forward: returns t_wrapped
+    # Backward: gradient of t_wrapped_detached w.r.t. t is 1 (identity)
+    return t + (t_wrapped - t).detach()
 
 
 def count_parameters(model: nn.Module) -> Dict[str, int]:

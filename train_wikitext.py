@@ -23,6 +23,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
+# Enable TF32 for better performance on Ampere+ GPUs
+torch.set_float32_matmul_precision('high')
+
 from transformers import GPT2TokenizerFast
 from datasets import load_dataset
 
@@ -130,6 +133,7 @@ def train(args):
         num_layers=args.num_layers,
         num_neurons=args.num_neurons,
         use_swish=args.use_swish,
+        wrap_time=True
     ).to(device)
     
     print(f"\n{model}")
@@ -246,8 +250,8 @@ def main():
     parser.add_argument("--seq_len", type=int, default=128, help="Sequence length")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--max_tokens", type=int, default=1_000_000, help="Max tokens to load")
     parser.add_argument("--use_swish", action="store_true", default=True, help="Use swish")

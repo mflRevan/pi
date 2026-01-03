@@ -141,17 +141,21 @@ class NeedleRIN(nn.Module):
     def forward(self, input_ids):
         lut = self._get_lut(input_ids.device)
         batch_size, seq_len = input_ids.shape
+        device = input_ids.device
         
         # Euler hidden state
-        h_real = torch.zeros(batch_size, self.d_model, device=input_ids.device)
-        h_imag = torch.zeros(batch_size, self.d_model, device=input_ids.device)
+        h_real = torch.zeros(batch_size, self.d_model, device=device)
+        h_imag = torch.zeros(batch_size, self.d_model, device=device)
         
         embeddings = self.token_embedding(input_ids)
         w_emb = embeddings[:, :, :self.d_model]
         b_emb = embeddings[:, :, self.d_model:]
         
+        # Pre-compute timestep tensors for torch.compile compatibility
+        t_indices = torch.arange(seq_len, device=device, dtype=torch.float32) * PHI
+        
         for t in range(seq_len):
-            t_val = t * PHI
+            t_val = t_indices[t]  # Scalar tensor
             wavelength = 1.0 + w_emb[:, t, :].abs()
             
             h_combined = h_real + h_imag
