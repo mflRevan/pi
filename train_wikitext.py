@@ -5,9 +5,20 @@ Train RIN on WikiText-2 Language Modeling
 Language modeling with the Euler-based Resonant Interference Network.
 Uses continuous waveform transformations with golden ratio timesteps.
 
+By default, uses EchoChamberModel with ResonantBlocks (Echo memory + Resonant layers).
+Can also use the original RINModel (resonant-only, no memory) with --model rin.
+
+BPTT (Backpropagation Through Time):
+    Sequences are processed in chunks (default 32 tokens) to reduce memory usage.
+    Memory state is detached between chunks for truncated BPTT.
+    Echo chamber memory persists across chunks but gradients are truncated.
+
 Usage:
-    python train_wikitext.py
+    python train_wikitext.py                           # EchoChamber model (default)
+    python train_wikitext.py --model rin               # Original RIN model
+    python train_wikitext.py --bptt_chunk 64           # Larger BPTT chunks
     python train_wikitext.py --d_model 256 --num_layers 4 --epochs 20
+    python train_wikitext.py --n_echo_heads 8          # More echo heads
 """
 
 import os
@@ -30,6 +41,7 @@ from transformers import GPT2TokenizerFast
 from datasets import load_dataset
 
 from rin import RINModel, PHI
+from rin.echo_chamber import EchoChamberModel
 
 
 class TextDataset(Dataset):
@@ -127,14 +139,25 @@ def train(args):
     print(f"Val batches: {len(val_loader)}")
     
     # Model
-    model = RINModel(
-        vocab_size=vocab_size,
-        d_model=args.d_model,
-        num_layers=args.num_layers,
-        num_neurons=args.num_neurons,
-        use_swish=args.use_swish,
-        wrap_time=True
-    ).to(device)
+    if args.model == "echo":
+        print(f"\nUsing EchoChamberModel (ResonantBlocks with Echo memory)")
+        model = EchoChamberModel(
+            vocab_size=vocab_size,
+            d_model=args.d_model,
+            num_layers=args.num_layers,
+            num_neurons=args.num_neurons,
+            n_echo_heads=args.n_echo_heads,
+        ).to(device)
+    else:
+        print(f"\nUsing RINModel (Resonant-only, no memory)")
+        model = RINModel(
+            vocab_size=vocab_size,
+            d_model=args.d_model,
+            num_layers=args.num_layers,
+            num_neurons=args.num_neurons,
+            use_swish=args.use_swish,
+            wrap_time=True
+        ).to(device)
     
     print(f"\n{model}")
     
@@ -184,10 +207,43 @@ def train(args):
             
             optimizer.zero_grad(set_to_none=True)
             
-            logits, _ = model(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-            
-            loss.backward()
+            # BPTT with chunking to reduce memory usage
+            if args.bptt_chunk > 0 and x.size(1) > args.bptt_chunk:
+                # Process sequence in chunks
+                total_loss = 0
+                num_chunks = 0
+                hidden = None
+                
+                for chunk_start in range(0, x.size(1), args.bptt_chunk):
+                    chunk_end = min(chunk_start + args.bptt_chunk, x.size(1))
+                    x_chunk = x[:, chunk_start:chunk_end].contiguous()
+                    y_chunk = y[:, chunk_start:chunk_end].contiguous()
+                    
+                    if args.model == "echo":
+                        # Reset memory only on first chunk
+                        logits, hidden = model(x_chunk, hidden=hidden, reset_memory=(chunk_start == 0))
+                        # Detach hidden to truncate BPTT
+                        hidden = (hidden[0].detach(), hidden[1].detach())
+                    else:
+                        logits, hidden = model(x_chunk, hidden=hidden)
+                        # Detach hidden to truncate BPTT
+                        hidden = (hidden[0].detach(), hidden[1].detach())
+                    
+                    chunk_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y_chunk.reshape(-1))
+                    chunk_loss.backward()
+                    total_loss += chunk_loss.item()
+                    num_chunks += 1
+                
+                loss = torch.tensor(total_loss / num_chunks)  # For logging
+            else:
+                # Full sequence (no chunking)
+                if args.model == "echo":
+                    logits, _ = model(x, reset_memory=True)
+                else:
+                    logits, _ = model(x)
+                
+                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+                loss.backward()
             
             # Gradient clipping
             if args.grad_clip > 0:
@@ -244,10 +300,14 @@ def train(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Train RIN on WikiText-2")
+    parser.add_argument("--model", type=str, default="echo", choices=["echo", "rin"],
+                        help="Model type: 'echo' (EchoChamberModel with memory) or 'rin' (resonant-only)")
     parser.add_argument("--d_model", type=int, default=256, help="Model dimension")
     parser.add_argument("--num_layers", type=int, default=4, help="Number of layers")
     parser.add_argument("--num_neurons", type=int, default=512, help="Neurons per layer")
+    parser.add_argument("--n_echo_heads", type=int, default=4, help="Number of echo heads (echo model only)")
     parser.add_argument("--seq_len", type=int, default=128, help="Sequence length")
+    parser.add_argument("--bptt_chunk", type=int, default=32, help="BPTT chunk size (0=full sequence)")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")

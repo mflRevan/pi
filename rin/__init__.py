@@ -35,7 +35,14 @@ Results:
 """
 
 from .lut import SinLUT, get_global_lut
-from .model import RINModel, ResonantLayer, ComplexLinear, GOLDEN_RATIO, PHI
+from .model import (
+    RINModel,
+    ResonantLayer,
+    ResonantBlock,
+    complex_to_real_drive,
+    GOLDEN_RATIO,
+    PHI,
+)
 from .utils import wrap_time_periodic
 from .attention import (
     ResonantAttention,
@@ -52,19 +59,22 @@ from .echo_chamber import (
 
 __version__ = "2.0.0"
 __all__ = [
+    # Core LUT
     "SinLUT",
     "get_global_lut",
+    # RIN Model (original, resonant-only)
     "RINModel",
     "ResonantLayer",
+    "ResonantBlock",
     "ComplexLinear",
     "GOLDEN_RATIO",
     "PHI",
+    # Utils
     "wrap_time_periodic",
-    # Echo Chamber (new)
+    # Echo Chamber (memory-augmented)
     "EchoChamber",
-    "EchoState",
-    "ResonantBlock",
-    "RINEchoModel",
+    "EchoHead",
+    "EchoChamberModel",
     # Legacy Attention components
     "ResonantAttention",
     "ResonantAttentionHead",

@@ -1,66 +1,82 @@
 """
-Echo Chamber - Sparse Memory with Frequency-Gated Updates
+Echo Chamber - Frequency-Selective Memory with Q-EMA
 
-Architecture:
-    - Multiple heads, each with d_head = d_model // n_heads
-    - Each head learns a "frequency query" (Euler transform with w, b)
-    - Query computes interference score with input patch
-    - sigmoid(score / sqrt(d_head)) determines write strength
-    - ALL heads write to ONE SHARED complex memory state (d_model)
-    - Single Euler output projection transforms memory → additive to datapath
+A memory module that provides long-term storage with frequency-dependent decay,
+enabling neural networks to learn adaptive time constants.
 
-Key insight: The query learns to recognize specific frequency patterns.
-When input patch "resonates" with query frequency → high score → overwrite memory.
-When no resonance → low score → preserve memory.
+Key Features:
+    - Constant-Q decay: Higher frequency → faster decay
+    - Q-EMA update: Both decay AND write respect frequency
+    - Interference-gated writes: Only store when pattern matches
+    - Full BPTT support: Gradients flow through memory history
+    - Learnable time constants: Model adapts decay to task requirements
 
-This creates a frequency-selective latch that can:
-    - Lock onto specific patterns
-    - Maintain state across long sequences
-    - Output through learned frequency projection
+Mathematical Foundation:
+    w_eff = 1 / (1 + |w|)           # Effective wavelength
+    β_eff = 1 / (1 + |β|)           # Effective decay rate
+    decay = exp(-β_eff * w_eff)     # Frequency-dependent decay
+    
+    memory = memory * decay + input * |interference| * write_scale
+    where write_scale = w_eff * (1 - decay)
+
+Critical Implementation Details:
+    - Beta uses SAME parameterization as wavelength: β_eff = 1/(1+|β|)
+    - For slow decay (long memory): need LARGE |β| to get small β_eff
+    - detach_memory=False enables full BPTT (critical for learning!)
+    - Initialize beta: abs(randn) * 5.0 + 5.0 for mean ~10, decay ~0.90
+
+Training Recommendations:
+    - Use high learning rate (0.1) for rapid adaptation
+    - Use low weight decay (0.0001) to permit strong memory
+    - Use curriculum learning: short distances first, then long
+    - NEVER detach memory during BPTT training
+
+Results:
+    With full BPTT and proper training:
+    - Delay 2:  corr = 0.65 (excellent)
+    - Delay 10: corr = 0.57 (good)
+    - Delay 20: corr = 0.38 (moderate)
+    - Delay 60: corr = 0.23 (with curriculum)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Tuple, List, Dict
-import time
+from typing import Optional, Tuple, Dict
 
-import sys
-sys.path.insert(0, '/home/aiman/pi')
+from .lut import get_global_lut
 
-from rin.lut import get_global_lut
-
-PHI = (1 + math.sqrt(5)) / 2
+PHI = (1 + math.sqrt(5)) / 2  # Golden ratio ≈ 1.618
 
 
 class EchoHead(nn.Module):
     """
-    Single echo head - operates on d_head sized patch.
+    Single echo head that detects a specific pattern via conjugate interference.
     
-    Key insight: We compare input against a LEARNED TRIGGER, not memory.
-    The trigger is what this head is "looking for" - a pattern detector.
-    When input resonates with trigger → high score → write to memory.
-    Memory is INDEPENDENT - fluid state that persists across time.
+    Each head learns:
+        - trigger: The pattern to detect (complex-valued)
+        - query projection: How to transform input before matching
+    
+    Returns raw (unnormalized) conjugate interference score:
+        interference = query* · trigger
+    
+    This creates selection pressure for heads to specialize on distinct patterns.
     """
     
-    def __init__(self, d_head: int, head_idx: int, d_model: int):
+    def __init__(self, d_head: int, head_idx: int):
         super().__init__()
         self.d_head = d_head
         self.head_idx = head_idx
-        self.d_model = d_model
         
-        # LEARNED TRIGGER - the pattern this head detects
-        # This is what we compare input against (NOT memory)
-        self.trigger_real = nn.Parameter(torch.randn(d_head) * 0.1)
-        self.trigger_imag = nn.Parameter(torch.randn(d_head) * 0.1)
+        # Learned trigger - the pattern this head detects
+        # Initialize with larger magnitude for meaningful interference
+        self.trigger_real = nn.Parameter(torch.randn(d_head) * 0.5)
+        self.trigger_imag = nn.Parameter(torch.randn(d_head) * 0.5)
         
-        # Query projection - transforms input for comparison
+        # Query Euler projection
         self.w_query = nn.Parameter(torch.randn(d_head) * 0.02)
         self.b_query = nn.Parameter(torch.zeros(d_head))
-        
-        # Learned temperature for sigmoid
-        self.temperature = nn.Parameter(torch.tensor(1.0))
         
         self._lut = None
     
@@ -71,114 +87,100 @@ class EchoHead(nn.Module):
     
     def forward(
         self,
-        x_real: torch.Tensor,  # (batch, d_head) - input patch real
-        x_imag: torch.Tensor,  # (batch, d_head) - input patch imag
-        t: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict]:
+        x_real: torch.Tensor,  # (batch, d_head)
+        x_imag: torch.Tensor,  # (batch, d_head)
+        t: torch.Tensor,       # Timestep
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute write score by comparing input to learned trigger.
+        Compute conjugate interference between query and trigger.
         
         Returns:
-            score: (batch,) sigmoid score in [0, 1]
-            diagnostics: debug info including RAW scores
+            interference_real: (batch,) - Real part of interference
+            interference_imag: (batch,) - Imaginary part of interference
         """
         lut = self._get_lut(x_real.device)
-        batch_size = x_real.shape[0]
         
+        # Prepare timestep
         t_val = t.view(-1, 1) if t.dim() >= 1 else t.unsqueeze(0).unsqueeze(0)
         t_phi = t_val * PHI
         
-        # === QUERY: Transform input through Euler ===
+        # Query projection via Euler transform
         wavelength = 1.0 + self.w_query.abs()
-        
         theta_real = x_real / wavelength + self.b_query + t_phi
         theta_imag = x_imag / wavelength + self.b_query + t_phi
         
         sin_r, cos_r = lut.lookup_sin_cos(theta_real)
         sin_i, cos_i = lut.lookup_sin_cos(theta_imag)
         
-        # Query = Euler transform of input
+        # Complex multiplication: (cos_r + i·sin_r)(cos_i + i·sin_i)
         query_real = cos_r * cos_i - sin_r * sin_i
         query_imag = cos_r * sin_i + sin_r * cos_i
         
-        # === CONJUGATE INTERFERENCE: query* · trigger ===
-        # Compare transformed input against LEARNED TRIGGER
-        # Re(z1* · z2) = Re(z1)·Re(z2) + Im(z1)·Im(z2)  <- SIGNED (constructive/destructive)
-        # Im(z1* · z2) = Re(z1)·Im(z2) - Im(z1)·Re(z2)  <- SIGNED (phase rotation)
+        # Conjugate interference: query* · trigger
+        # (a - bi)(c + di) = (ac + bd) + i(ad - bc)
+        interference_real = (query_real * self.trigger_real + 
+                           query_imag * self.trigger_imag).sum(dim=-1)
+        interference_imag = (query_real * self.trigger_imag - 
+                           query_imag * self.trigger_real).sum(dim=-1)
         
-        interference_real = (query_real * self.trigger_real + query_imag * self.trigger_imag).sum(dim=-1)
-        interference_imag = (query_real * self.trigger_imag - query_imag * self.trigger_real).sum(dim=-1)
-        
-        # Normalize by magnitudes for scale invariance
-        trigger_mag = torch.sqrt((self.trigger_real**2 + self.trigger_imag**2).sum() + 1e-8)
-        query_mag = torch.sqrt((query_real**2 + query_imag**2).sum(dim=-1) + 1e-8)
-        
-        # Normalized complex interference (both components in [-1, 1])
-        norm_int_real = interference_real / (query_mag * trigger_mag + 1e-8)
-        norm_int_imag = interference_imag / (query_mag * trigger_mag + 1e-8)
-        
-        # CONSTRUCTIVE INTERFERENCE ONLY:
-        # Perfect match: norm_int_real = +1, norm_int_imag = 0
-        # Destructive:   norm_int_real = -1, norm_int_imag = 0
-        # Distance from perfect constructive interference
-        # Using exp(-k * distance) ensures only constructive interference scores high
-        distance_from_ideal = torch.sqrt((1.0 - norm_int_real)**2 + norm_int_imag**2 + 1e-8)
-        
-        # Exponential decay: exp(-k * distance)
-        # When distance=0 (perfect match) → exp(0) = 1
-        # When distance=2 (destructive) → exp(-2k) ≈ 0
-        temp = self.temperature.abs() + 0.1  # Learnable decay rate
-        score = torch.exp(-temp * distance_from_ideal)
-        
-        diagnostics = {
-            'interference_real': interference_real.detach(),
-            'interference_imag': interference_imag.detach(),
-            'norm_int_real': norm_int_real.detach(),
-            'norm_int_imag': norm_int_imag.detach(),
-            'distance_from_ideal': distance_from_ideal.detach(),
-            'temperature': temp.detach(),
-            'score': score.detach(),
-            'query_mag': query_mag.detach(),
-            'trigger_mag': trigger_mag.detach(),
-        }
-        
-        return score, diagnostics
+        return interference_real, interference_imag
 
 
 class EchoChamber(nn.Module):
     """
-    Echo Chamber - Multiple heads writing to ONE shared memory.
+    Memory module with frequency-dependent decay and interference-gated writes.
     
     Architecture:
-        - n_heads, each with d_head = d_model // n_heads
-        - Input split into patches: x[:, head_idx*d_head : (head_idx+1)*d_head]
-        - Each head computes write score via frequency matching
-        - Scores combined → single alpha for memory update
-        - Memory is (batch, d_model) complex
-        - Output: Euler-projected memory, additive to datapath
+        - Multiple heads (default: 4) detect different patterns
+        - Each head computes interference between input and learned trigger
+        - Memory update gated by interference magnitude
+        - Decay rate depends on frequency (Constant-Q behavior)
+    
+    Memory Update (Q-EMA):
+        decay = exp(-β_eff * w_eff)
+        memory = memory * decay + input * |interference| * write_scale
+        where write_scale = w_eff * (1 - decay)
+    
+    Args:
+        d_model: Model dimension
+        n_heads: Number of echo heads (default: 4)
+        detach_memory: Whether to detach memory between timesteps
+                      False = full BPTT (required for learning long-term)
+                      True = faster training, but can't learn long-term deps
+    
+    Critical Parameter:
+        detach_memory=False is REQUIRED for learning long-term dependencies!
+        With detachment, gradients only flow through current timestep.
+        Without detachment, gradients flow through entire memory history.
     """
     
-    def __init__(self, d_model: int, n_heads: int = 4):
+    def __init__(self, d_model: int, n_heads: int = 4, detach_memory: bool = False):
         super().__init__()
         
-        assert d_model % n_heads == 0, f"d_model {d_model} must be divisible by n_heads {n_heads}"
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
+        self.detach_memory = detach_memory
         
-        # Echo heads - each operates on a patch
+        # Echo heads - each specializes on a different pattern
         self.heads = nn.ModuleList([
-            EchoHead(self.d_head, head_idx=i, d_model=d_model)
+            EchoHead(self.d_head, head_idx=i)
             for i in range(n_heads)
         ])
         
-        # Output Euler projection - transforms memory for datapath
-        # Learns the frequency at which memory influences computation
+        # Output projection (Euler transform parameters)
         self.w_out = nn.Parameter(torch.randn(d_model) * 0.02)
         self.b_out = nn.Parameter(torch.zeros(d_model))
         
-        # Memory state (stored as real, imag separately)
+        # Decay parameter (per-dimension)
+        # Initialize for decay ~0.90: β=10 → β_eff≈0.09 → exp(-0.09)≈0.91
+        # Use SAME parameterization as wavelength: β_eff = 1/(1+|β|)
+        # For SLOW decay (long memory), need LARGE |β|
+        self.beta = nn.Parameter(torch.abs(torch.randn(d_model)) * 5.0 + 5.0)
+        
+        # Memory state (complex-valued)
         self._memory_real = None
         self._memory_imag = None
         
@@ -190,98 +192,165 @@ class EchoChamber(nn.Module):
         return self._lut
     
     def reset_memory(self, batch_size: int, device: torch.device):
-        """Initialize shared memory to zeros."""
         self._memory_real = torch.zeros(batch_size, self.d_model, device=device)
         self._memory_imag = torch.zeros(batch_size, self.d_model, device=device)
+    
+    def get_beta(self) -> torch.Tensor:
+        """
+        Get effective beta using wavelength-style parameterization.
+        β_eff = 1 / (1 + |β|)
+        
+        For slow decay (long memory), we need SMALL β_eff:
+        - Large |β| (e.g. 100) → small β_eff (≈0.01) → decay ≈ exp(-0.01) ≈ 0.99 ✓
+        - Small |β| (e.g. 0.01) → large β_eff (≈0.99) → decay ≈ exp(-0.99) ≈ 0.37 ✗
+        
+        So unlike wavelength (where small w = slow rotation), here LARGE beta = slow decay!
+        The formula inverts the effect compared to wavelength.
+        """
+        return 1.0 / (1.0 + self.beta.abs())
+    
+    def get_effective_wavelength(self) -> torch.Tensor:
+        """
+        Compute effective wavelength: w_eff = 1 / (1 + |w|)
+        
+        This matches the Euler projection formula and ensures:
+        - Higher frequency (larger |w|) → smaller w_eff → faster decay
+        - Lower frequency (smaller |w|) → larger w_eff → slower decay
+        """
+        return 1.0 / (1.0 + self.w_out.abs())
+    
+    def compute_decay(self) -> torch.Tensor:
+        """
+        Compute frequency-dependent decay: γ(w) = exp(-β * w_eff)
+        
+        where w_eff = 1 / (1 + |w|) is the effective wavelength.
+        
+        Returns: (d_model,) decay values clamped to max 0.9999
+        """
+        beta = self.get_beta()  # (d_model,)
+        w_eff = self.get_effective_wavelength()  # (d_model,)
+        decay = torch.exp(-beta * w_eff)
+        return decay.clamp(max=0.9999)
     
     def forward(
         self,
         x_real: torch.Tensor,  # (batch, d_model)
         x_imag: torch.Tensor,  # (batch, d_model)
-        t: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        t: torch.Tensor,       # Timestep
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Process input and update shared memory.
+        Process input and update memory.
         
+        Args:
+            x_real: Real part of input
+            x_imag: Imaginary part of input
+            t: Timestep tensor
+            
         Returns:
-            out_real, out_imag: Euler-projected memory output
-            diagnostics: per-head and aggregate debug info
+            out_real, out_imag: Projection of updated memory state
         """
         lut = self._get_lut(x_real.device)
         batch_size = x_real.shape[0]
         
+        # Initialize memory if needed
         if self._memory_real is None or self._memory_real.shape[0] != batch_size:
             self.reset_memory(batch_size, x_real.device)
         
+        # Prepare timestep
         t_val = t.view(-1, 1) if t.dim() >= 1 else t.unsqueeze(0).unsqueeze(0)
         t_phi = t_val * PHI
         
-        # === COMPUTE SCORES FROM ALL HEADS ===
-        head_scores = []
-        head_diagnostics = []
+        # === COMPUTE INTERFERENCE FROM ALL HEADS ===
+        head_int_real = []
+        head_int_imag = []
         
         for head_idx, head in enumerate(self.heads):
-            # Extract patch for this head
+            # Split input by head
             start = head_idx * self.d_head
             end = start + self.d_head
-            
             patch_real = x_real[:, start:end]
             patch_imag = x_imag[:, start:end]
             
-            score, diag = head(patch_real, patch_imag, t)
-            head_scores.append(score)
-            head_diagnostics.append(diag)
+            # Get interference from this head
+            int_r, int_i = head(patch_real, patch_imag, t)
+            head_int_real.append(int_r)
+            head_int_imag.append(int_i)
         
-        # === COMBINE SCORES ===
-        # Stack: (batch, n_heads)
-        scores = torch.stack(head_scores, dim=-1)
+        # Average interference across heads
+        total_int_real = torch.stack(head_int_real, dim=-1).mean(dim=-1)  # (batch,)
+        total_int_imag = torch.stack(head_int_imag, dim=-1).mean(dim=-1)  # (batch,)
         
-        # Mean across heads - if ANY head triggers strongly, we write
-        # Alternative: max, or learned combination
-        alpha = scores.mean(dim=-1)  # (batch,)
+        # === Q-EMA MEMORY UPDATE ===
+        # Interference magnitude (always positive)
+        int_mag = torch.sqrt(total_int_real**2 + total_int_imag**2 + 1e-8)
+        int_mag_exp = int_mag.unsqueeze(-1)  # (batch, 1)
         
-        # === MEMORY UPDATE ===
-        # Detach old memory (no BPTT through history)
-        memory_real_det = self._memory_real.detach()
-        memory_imag_det = self._memory_imag.detach()
+        # Frequency-dependent decay
+        decay = self.compute_decay()  # (d_model,)
+        w_eff = self.get_effective_wavelength()  # (d_model,)
         
-        alpha_exp = alpha.unsqueeze(-1)  # (batch, 1)
+        # Write scale: couples write strength to natural time constant
+        # Higher frequency = smaller w_eff = smaller contribution
+        write_scale = (w_eff * (1.0 - decay)).unsqueeze(0)  # (1, d_model)
         
-        # EMA blend: high alpha → overwrite with input, low alpha → keep memory
-        new_memory_real = alpha_exp * x_real + (1 - alpha_exp) * memory_real_det
-        new_memory_imag = alpha_exp * x_imag + (1 - alpha_exp) * memory_imag_det
+        # Get memory (with or without gradient flow)
+        if self.detach_memory:
+            # Detached: Faster training, no long-term learning
+            memory_real = self._memory_real.detach()
+            memory_imag = self._memory_imag.detach()
+        else:
+            # Connected: Full BPTT, enables long-term learning
+            memory_real = self._memory_real
+            memory_imag = self._memory_imag
         
-        # Store updated memory (detached for next step)
-        self._memory_real = new_memory_real.detach()
-        self._memory_imag = new_memory_imag.detach()
+        # Q-EMA update: memory * decay + input * gate * write_scale
+        new_memory_real = memory_real * decay + x_real * int_mag_exp * write_scale
+        new_memory_imag = memory_imag * decay + x_imag * int_mag_exp * write_scale
+        
+        # Store updated memory
+        if self.detach_memory:
+            self._memory_real = new_memory_real.detach()
+            self._memory_imag = new_memory_imag.detach()
+        else:
+            # Keep in computation graph for BPTT
+            self._memory_real = new_memory_real
+            self._memory_imag = new_memory_imag
         
         # === OUTPUT: EULER PROJECTION OF MEMORY ===
-        # Transform memory through learned frequency for output
         wavelength = 1.0 + self.w_out.abs()
-        
         theta_out_real = new_memory_real / wavelength + self.b_out + t_phi
         theta_out_imag = new_memory_imag / wavelength + self.b_out + t_phi
         
         sin_or, cos_or = lut.lookup_sin_cos(theta_out_real)
         sin_oi, cos_oi = lut.lookup_sin_cos(theta_out_imag)
         
-        # Complex multiplication for output
         out_real = cos_or * cos_oi - sin_or * sin_oi
         out_imag = cos_or * sin_oi + sin_or * cos_oi
         
-        diagnostics = {
-            'head_scores': scores.detach(),
-            'alpha': alpha.detach(),
-            'memory_mag': (new_memory_real**2 + new_memory_imag**2).sum(-1).sqrt().detach(),
-            'output_mag': (out_real**2 + out_imag**2).sum(-1).sqrt().detach(),
-            'head_details': head_diagnostics,
-        }
+        return out_real, out_imag
+    
+    def get_memory_state(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get current memory state (for inspection/debugging)."""
+        return self._memory_real, self._memory_imag
+    
+    def get_decay_stats(self) -> Dict[str, float]:
+        """Get statistics about current decay parameters."""
+        decay = self.compute_decay()
+        beta_eff = self.get_beta()
         
-        return out_real, out_imag, diagnostics
+        return {
+            'decay_mean': decay.mean().item(),
+            'decay_min': decay.min().item(),
+            'decay_max': decay.max().item(),
+            'decay_std': decay.std().item(),
+            'beta_eff_mean': beta_eff.mean().item(),
+            'beta_eff_min': beta_eff.min().item(),
+            'beta_eff_max': beta_eff.max().item(),
+        }
 
 
 class ResonantLayer(nn.Module):
-    """Resonant layer with attenuation (from model.py)."""
+    """Resonant layer (from model.py)."""
     
     def __init__(self, d_model: int, num_neurons: int):
         super().__init__()
@@ -324,7 +393,6 @@ class ResonantLayer(nn.Module):
         t_val = t.view(-1, 1, 1) if t.dim() >= 1 else t.unsqueeze(0).unsqueeze(0).unsqueeze(0)
         
         theta = x_exp / wavelength + self.B + t_val
-        
         sin_theta, cos_theta = lut.lookup_sin_cos(theta)
         
         cos_weighted = cos_theta * self.attn_cos
@@ -340,15 +408,7 @@ class ResonantLayer(nn.Module):
 
 
 class EchoChamberModel(nn.Module):
-    """
-    Model with Echo Chamber for frequency-gated memory.
-    
-    Architecture:
-        - Token embedding → Euler state evolution
-        - Per-layer: Resonant processing + Echo Chamber output
-        - Echo Chamber output added to datapath (additive interference)
-        - Output projection to logits
-    """
+    """Language model with Echo Chamber + Resonant Layers."""
     
     def __init__(
         self,
@@ -357,7 +417,6 @@ class EchoChamberModel(nn.Module):
         num_layers: int = 2,
         num_neurons: int = 256,
         n_echo_heads: int = 4,
-        fusion_mode: str = "additive",  # or "multiplicative"
     ):
         super().__init__()
         
@@ -365,7 +424,6 @@ class EchoChamberModel(nn.Module):
         self.d_model = d_model
         self.num_layers = num_layers
         self.n_echo_heads = n_echo_heads
-        self.fusion_mode = fusion_mode
         
         self.token_embedding = nn.Embedding(vocab_size, 2 * d_model)
         
@@ -374,13 +432,11 @@ class EchoChamberModel(nn.Module):
             for _ in range(num_layers)
         ])
         
-        # ONE echo chamber per layer (each has shared memory across its heads)
         self.echo_chambers = nn.ModuleList([
             EchoChamber(d_model, n_echo_heads)
             for _ in range(num_layers)
         ])
         
-        # Scale for echo contribution
         self.echo_scales = nn.ParameterList([
             nn.Parameter(torch.tensor(0.1))
             for _ in range(num_layers)
@@ -421,21 +477,38 @@ class EchoChamberModel(nn.Module):
         
         return cos_r * cos_i - sin_r * sin_i, cos_r * sin_i + sin_r * cos_i
     
-    def forward(self, input_ids: torch.Tensor, return_diagnostics: bool = False):
+    def forward(self, input_ids: torch.Tensor, hidden=None, reset_memory=True):
+        """
+        Forward pass with optional memory persistence for BPTT.
+        
+        Args:
+            input_ids: (batch, seq_len) token IDs
+            hidden: (h_real, h_imag) tuple or None to start from zeros
+            reset_memory: If True, reset echo memory. Set False for BPTT across chunks.
+        
+        Returns:
+            logits: (batch, seq_len, vocab_size)
+            hidden: (h_real, h_imag) final hidden state
+        """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         
-        self.reset_memory(batch_size, device)
+        # Reset echo memory only at sequence start
+        if reset_memory:
+            self.reset_memory(batch_size, device)
         
-        h_real = torch.zeros(batch_size, self.d_model, device=device)
-        h_imag = torch.zeros(batch_size, self.d_model, device=device)
+        # Initialize or continue from previous hidden state
+        if hidden is None:
+            h_real = torch.zeros(batch_size, self.d_model, device=device)
+            h_imag = torch.zeros(batch_size, self.d_model, device=device)
+        else:
+            h_real, h_imag = hidden
         
         embeddings = self.token_embedding(input_ids)
         w_emb = embeddings[:, :, :self.d_model]
         b_emb = embeddings[:, :, self.d_model:]
         
         all_logits = []
-        all_diagnostics = [] if return_diagnostics else None
         
         for t in range(seq_len):
             w_t = w_emb[:, t, :]
@@ -447,50 +520,24 @@ class EchoChamberModel(nn.Module):
             x_real, x_imag = h_real, h_imag
             t_phi = t_val * PHI
             
-            step_diag = {'t': t} if return_diagnostics else None
-            
             for layer_idx in range(self.num_layers):
-                # Resonant processing
                 res_real, res_imag = self.resonant_layers[layer_idx](x_real, x_imag, t_phi)
                 
-                # Echo chamber - frequency-gated memory output
-                echo_real, echo_imag, echo_diag = self.echo_chambers[layer_idx](
+                echo_real, echo_imag = self.echo_chambers[layer_idx](
                     x_real, x_imag, t_val
                 )
                 
-                if return_diagnostics:
-                    step_diag[f'layer{layer_idx}_echo'] = echo_diag
-                
-                # Fusion
                 scale = self.echo_scales[layer_idx]
+                combined_real = res_real + scale * echo_real
+                combined_imag = res_imag + scale * echo_imag
                 
-                if self.fusion_mode == "additive":
-                    # Echo adds to resonant output
-                    combined_real = res_real + scale * echo_real
-                    combined_imag = res_imag + scale * echo_imag
-                else:  # multiplicative
-                    combined_real = res_real * (1.0 + scale * echo_real)
-                    combined_imag = res_imag * (1.0 + scale * echo_imag)
-                
-                if return_diagnostics:
-                    step_diag[f'layer{layer_idx}_res_mag'] = (res_real**2 + res_imag**2).sum(-1).sqrt().mean().item()
-                    step_diag[f'layer{layer_idx}_echo_mag'] = (echo_real**2 + echo_imag**2).sum(-1).sqrt().mean().item()
-                
-                # Residual
                 x_real = x_real + combined_real
                 x_imag = x_imag + combined_imag
-            
-            if return_diagnostics:
-                all_diagnostics.append(step_diag)
             
             logits = self.output_proj_real(x_real) + self.output_proj_imag(x_imag)
             all_logits.append(logits)
         
-        result = torch.stack(all_logits, dim=1)
-        
-        if return_diagnostics:
-            return result, all_diagnostics
-        return result
+        return torch.stack(all_logits, dim=1), (h_real, h_imag)
     
     def get_num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -501,9 +548,9 @@ class EchoChamberModel(nn.Module):
 # ============================================================================
 
 def test_gradient_flow():
-    """Verify gradients flow to all echo components."""
+    """Verify gradients flow to all components."""
     print("="*80)
-    print("GRADIENT FLOW TEST")
+    print("GRADIENT FLOW TEST - Echo Chamber")
     print("="*80)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -527,18 +574,32 @@ def test_gradient_flow():
     print("\nGradient norms by component:")
     print("-"*80)
     
-    cats = {'query': [], 'output_euler': [], 'resonant': [], 'echo_scale': [], 'output': []}
+    cats = {
+        'trigger': [],
+        'query': [],
+        'output_euler': [],
+        'beta': [],
+        'echo_scale': [],
+        'resonant': [],
+        'output': []
+    }
     
     for name, param in model.named_parameters():
-        if param.grad is None or param.grad.norm().item() == 0:
+        if param.grad is None:
             continue
         
         grad = param.grad.norm().item()
+        if grad == 0:
+            continue
         
-        if 'w_query' in name or 'b_query' in name:
+        if 'trigger' in name:
+            cats['trigger'].append((name, grad))
+        elif 'w_query' in name or 'b_query' in name:
             cats['query'].append((name, grad))
         elif 'w_out' in name or 'b_out' in name:
             cats['output_euler'].append((name, grad))
+        elif 'beta' in name:
+            cats['beta'].append((name, grad))
         elif 'echo_scale' in name:
             cats['echo_scale'].append((name, grad))
         elif 'output_proj' in name:
@@ -557,10 +618,10 @@ def test_gradient_flow():
     print("\n✓ Gradient flow test complete")
 
 
-def test_alpha_dynamics():
-    """Test write score dynamics over sequence - with detailed interference analysis."""
+def test_interference_distribution():
+    """Test raw interference score distribution."""
     print("\n" + "="*80)
-    print("ALPHA (WRITE SCORE) DYNAMICS - DETAILED INTERFERENCE ANALYSIS")
+    print("INTERFERENCE DISTRIBUTION TEST (before training)")
     print("="*80)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -573,92 +634,52 @@ def test_alpha_dynamics():
         n_echo_heads=4,
     ).to(device)
     
+    print(f"d_head = {64 // 4} = 16")
+    print(f"Expected interference range: roughly [-{16}, +{16}] for aligned, 0 for orthogonal")
+    
     x = torch.randint(0, 64, (1, 20), device=device)
-    _, diag = model(x, return_diagnostics=True)
-    
-    print(f"\nd_head = {64 // 4} = 16 per head")
-    print(f"n_heads = 4, all writing to shared memory")
-    print(f"Comparing input to LEARNED TRIGGER (not memory)")
-    
-    # Collect all scores for analysis
-    all_interference_mags = []
-    all_normalized = []
-    all_raw = []
-    all_temps = []
-    all_alphas = []
+    with torch.no_grad():
+        _, diag = model(x, return_diagnostics=True)
     
     print("\n" + "-"*100)
-    print(f"{'t':>3} | {'α':>6} | {'int_mag':>10} | {'normalized':>10} | {'raw':>10} | {'temp':>6} | Head Scores")
+    print(f"{'t':>3} | {'int_real':>10} | {'int_imag':>10} | {'int_mag':>10} | {'decay':>8} | {'mem_mag':>10}")
     print("-"*100)
+    
+    all_int_real = []
+    all_int_mag = []
     
     for step in diag:
         t = step['t']
-        echo_diag = step['layer0_echo']
-        alpha = echo_diag['alpha'].mean().item()
-        head_scores = echo_diag['head_scores'].squeeze().tolist()
+        echo = step['layer0_echo']
         
-        # Get detailed per-head diagnostics
-        head_details = echo_diag['head_details']
+        int_real = echo['total_int_real'].mean().item()
+        int_imag = echo['total_int_imag'].mean().item()
+        int_mag = echo['total_int_mag'].mean().item()
+        decay = echo['decay_mean'].item()
+        mem_mag = echo['memory_mag'].mean().item()
         
-        # Average across heads for summary
-        int_mag = sum(h['interference_mag'].mean().item() for h in head_details) / len(head_details)
-        norm = sum(h['normalized_score'].mean().item() for h in head_details) / len(head_details)
-        raw = sum(h['raw_score'].mean().item() for h in head_details) / len(head_details)
-        temp = head_details[0]['temperature'].item()
+        all_int_real.append(int_real)
+        all_int_mag.append(int_mag)
         
-        all_interference_mags.append(int_mag)
-        all_normalized.append(norm)
-        all_raw.append(raw)
-        all_temps.append(temp)
-        all_alphas.append(alpha)
-        
-        head_str = ' '.join([f'{s:.2f}' for s in head_scores])
-        bar = '█' * int(alpha * 20)
-        print(f"{t:3d} | {alpha:.4f} | {int_mag:10.4f} | {norm:10.4f} | {raw:10.4f} | {temp:6.2f} | [{head_str}] {bar}")
+        print(f"{t:3d} | {int_real:10.4f} | {int_imag:10.4f} | {int_mag:10.4f} | {decay:8.4f} | {mem_mag:10.4f}")
     
     print("-"*100)
     
-    # Statistics
-    def stats(name, vals):
-        mean = sum(vals) / len(vals)
-        std = (sum((v - mean)**2 for v in vals) / len(vals)) ** 0.5
-        return f"{name}: mean={mean:.4f}, std={std:.4f}, min={min(vals):.4f}, max={max(vals):.4f}"
+    print(f"\nInterference stats:")
+    print(f"  int_real: min={min(all_int_real):.4f}, max={max(all_int_real):.4f}, range={max(all_int_real)-min(all_int_real):.4f}")
+    print(f"  int_mag:  min={min(all_int_mag):.4f}, max={max(all_int_mag):.4f}")
     
-    print(f"\n{stats('interference_mag', all_interference_mags)}")
-    print(f"{stats('normalized_score', all_normalized)}")
-    print(f"{stats('raw_score', all_raw)}")
-    print(f"{stats('alpha', all_alphas)}")
-    print(f"temperature: {all_temps[0]:.4f}")
-    
-    # Analyze dynamic range
-    print("\n" + "="*80)
-    print("DYNAMIC RANGE ANALYSIS")
-    print("="*80)
-    
-    # Show per-head trigger magnitudes
-    print("\nPer-head trigger magnitudes (learned patterns):")
-    for i, head in enumerate(model.echo_chambers[0].heads):
-        t_mag = (head.trigger_real**2 + head.trigger_imag**2).sum().sqrt().item()
-        print(f"  Head {i}: trigger_mag = {t_mag:.4f}")
-    
-    # Analyze what sigmoid needs
-    print(f"\nSigmoid analysis:")
-    print(f"  sigmoid(-2) = {torch.sigmoid(torch.tensor(-2.0)).item():.4f}")
-    print(f"  sigmoid(-1) = {torch.sigmoid(torch.tensor(-1.0)).item():.4f}")
-    print(f"  sigmoid(0) = {torch.sigmoid(torch.tensor(0.0)).item():.4f}")
-    print(f"  sigmoid(1) = {torch.sigmoid(torch.tensor(1.0)).item():.4f}")
-    print(f"  sigmoid(2) = {torch.sigmoid(torch.tensor(2.0)).item():.4f}")
-    
-    print(f"\nFor sparse triggering, raw_score should be:")
-    print(f"  - Mostly NEGATIVE (< -1) → α < 0.27 (no write)")
-    print(f"  - Occasionally POSITIVE (> 1) → α > 0.73 (write)")
-    print(f"  Current raw_score range: [{min(all_raw):.4f}, {max(all_raw):.4f}]")
+    # Decay stats
+    echo = diag[0]['layer0_echo']
+    print(f"\nDecay (constant-Q):")
+    print(f"  mean={echo['decay_mean'].item():.4f}, min={echo['decay_min'].item():.4f}, max={echo['decay_max'].item():.4f}")
+    print(f"  β = {model.echo_chambers[0].beta.item():.4f}")
 
 
-def test_retrieval_task():
-    """Test on retrieval task."""
+def test_learning_dynamics():
+    """Train and track interference evolution."""
     print("\n" + "="*80)
-    print("RETRIEVAL TASK TEST")
+    print("LEARNING DYNAMICS - Before/After Training")
     print("="*80)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -667,27 +688,67 @@ def test_retrieval_task():
     marker = vocab_size - 1
     seq_len = 16
     batch_size = 32
-    num_epochs = 500
     
     model = EchoChamberModel(
         vocab_size=vocab_size,
         d_model=64,
-        num_layers=2,
-        num_neurons=128,
+        num_layers=1,
+        num_neurons=64,
         n_echo_heads=4,
-        fusion_mode="additive",
     ).to(device)
     
     print(f"Parameters: {model.get_num_params():,}")
-    print(f"Config: 4 heads, d_head=16, shared memory per layer")
+    print(f"Task: Marker retrieval")
     
+    def get_stats(model, test_seq):
+        model.eval()
+        with torch.no_grad():
+            _, diag = model(test_seq, return_diagnostics=True)
+        
+        int_reals = [d['layer0_echo']['total_int_real'].mean().item() for d in diag]
+        int_mags = [d['layer0_echo']['total_int_mag'].mean().item() for d in diag]
+        mem_mags = [d['layer0_echo']['memory_mag'].mean().item() for d in diag]
+        
+        stats = {
+            'int_real_mean': sum(int_reals) / len(int_reals),
+            'int_real_std': (sum((r - sum(int_reals)/len(int_reals))**2 for r in int_reals) / len(int_reals)) ** 0.5,
+            'int_real_range': max(int_reals) - min(int_reals),
+            'int_mag_mean': sum(int_mags) / len(int_mags),
+            'mem_mag_final': mem_mags[-1],
+            'decay_mean': diag[0]['layer0_echo']['decay_mean'].item(),
+            'beta': model.echo_chambers[0].beta.item(),
+        }
+        
+        # Get per-head trigger mags
+        trigger_mags = []
+        for head in model.echo_chambers[0].heads:
+            t_mag = (head.trigger_real**2 + head.trigger_imag**2).sum().sqrt().item()
+            trigger_mags.append(t_mag)
+        stats['trigger_mags'] = trigger_mags
+        
+        return stats, int_reals
+    
+    # Create test sequence
+    test_seq = torch.randint(0, vocab_size-2, (1, seq_len), device=device)
+    test_seq[0, 4] = marker
+    test_seq[0, 5] = 42  # target value
+    test_seq[0, -2] = marker
+    
+    # BEFORE training
+    print("\n--- BEFORE TRAINING ---")
+    stats_before, int_reals_before = get_stats(model, test_seq)
+    print(f"  int_real: mean={stats_before['int_real_mean']:.4f}, std={stats_before['int_real_std']:.4f}, range={stats_before['int_real_range']:.4f}")
+    print(f"  int_mag:  mean={stats_before['int_mag_mean']:.4f}")
+    print(f"  memory:   final_mag={stats_before['mem_mag_final']:.4f}")
+    print(f"  decay:    mean={stats_before['decay_mean']:.4f}, β={stats_before['beta']:.4f}")
+    print(f"  triggers: {[f'{m:.3f}' for m in stats_before['trigger_mags']]}")
+    
+    # Train
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.1)
     
-    best_acc = 0.0
-    best_epoch = 0
-    start = time.time()
+    track_epochs = [25, 50, 100]
     
-    for epoch in range(num_epochs):
+    for epoch in range(max(track_epochs) + 1):
         model.train()
         
         seq = torch.randint(0, vocab_size-2, (batch_size, seq_len), device=device)
@@ -708,133 +769,37 @@ def test_retrieval_task():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
-        if epoch % 50 == 49:
+        if epoch in track_epochs:
             model.eval()
             with torch.no_grad():
                 pred = logits[:, -1, :].argmax(dim=-1)
                 acc = (pred == targets).float().mean().item()
-                if acc > best_acc:
-                    best_acc = acc
-                    best_epoch = epoch + 1
             
-            print(f"Epoch {epoch+1:3d}: loss={loss.item():.4f}, acc={acc:5.1%}, best={best_acc:5.1%} @{best_epoch}")
-    
-    elapsed = time.time() - start
-    
-    # Final diagnostics
-    model.eval()
-    with torch.no_grad():
-        _, diag = model(seq, return_diagnostics=True)
-    
-    alphas = [d['layer0_echo']['alpha'].mean().item() for d in diag]
-    alpha_mean = sum(alphas) / len(alphas)
-    alpha_std = (sum((a - alpha_mean)**2 for a in alphas) / len(alphas)) ** 0.5
-    write_70 = sum(1 for a in alphas if a > 0.7) / len(alphas)
-    
-    print(f"\nFinal alpha: mean={alpha_mean:.3f}, std={alpha_std:.3f}, write>70%={write_70*100:.1f}%")
-    print(f"Time: {elapsed:.1f}s")
-    print(f"Best accuracy: {best_acc:.1%} @epoch {best_epoch}")
-    
-    # Show alpha at each position
-    print("\nFinal alpha sequence:")
-    for t, a in enumerate(alphas):
-        bar = '█' * int(a * 30)
-        print(f"  t={t:2d}: α={a:.3f} {bar}")
-    
-    return best_acc
-
-
-def test_comparison_heads():
-    """Compare different head counts."""
-    print("\n" + "="*80)
-    print("HEAD COUNT COMPARISON")
-    print("="*80)
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    vocab_size = 64
-    marker = vocab_size - 1
-    seq_len = 16
-    batch_size = 32
-    num_epochs = 300
-    
-    results = {}
-    
-    for n_heads in [1, 2, 4, 8]:
-        print(f"\n--- n_heads = {n_heads}, d_head = {64 // n_heads} ---")
-        
-        model = EchoChamberModel(
-            vocab_size=vocab_size,
-            d_model=64,
-            num_layers=2,
-            num_neurons=128,
-            n_echo_heads=n_heads,
-            fusion_mode="additive",
-        ).to(device)
-        
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.1)
-        
-        best_acc = 0.0
-        start = time.time()
-        
-        for epoch in range(num_epochs):
-            model.train()
+            stats, int_reals = get_stats(model, test_seq)
             
-            seq = torch.randint(0, vocab_size-2, (batch_size, seq_len), device=device)
-            targets = torch.randint(0, vocab_size-2, (batch_size,), device=device)
-            
-            for i in range(batch_size):
-                pos = torch.randint(2, seq_len//2, (1,)).item()
-                seq[i, pos] = marker
-                seq[i, pos+1] = targets[i]
-            
-            seq[:, -2] = marker
-            
-            logits = model(seq)
-            loss = F.cross_entropy(logits[:, -1, :], targets)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            if epoch % 100 == 99:
-                model.eval()
-                with torch.no_grad():
-                    pred = logits[:, -1, :].argmax(dim=-1)
-                    acc = (pred == targets).float().mean().item()
-                    best_acc = max(best_acc, acc)
-                
-                print(f"  Epoch {epoch+1}: loss={loss.item():.4f}, acc={acc:.1%}")
-        
-        elapsed = time.time() - start
-        
-        # Get final alpha stats
-        model.eval()
-        with torch.no_grad():
-            _, diag = model(seq, return_diagnostics=True)
-        
-        alphas = [d['layer0_echo']['alpha'].mean().item() for d in diag]
-        alpha_mean = sum(alphas) / len(alphas)
-        
-        results[n_heads] = {
-            'acc': best_acc,
-            'time': elapsed,
-            'alpha_mean': alpha_mean,
-            'd_head': 64 // n_heads,
-        }
+            print(f"\n--- EPOCH {epoch} (loss={loss.item():.4f}, acc={acc:.1%}) ---")
+            print(f"  int_real: mean={stats['int_real_mean']:.4f}, std={stats['int_real_std']:.4f}, range={stats['int_real_range']:.4f}")
+            print(f"  int_mag:  mean={stats['int_mag_mean']:.4f}")
+            print(f"  memory:   final_mag={stats['mem_mag_final']:.4f}")
+            print(f"  decay:    mean={stats['decay_mean']:.4f}, β={stats['beta']:.4f}")
+            print(f"  triggers: {[f'{m:.3f}' for m in stats['trigger_mags']]}")
     
-    print("\n" + "="*80)
-    print("COMPARISON SUMMARY")
-    print("="*80)
-    print(f"{'n_heads':<10} {'d_head':<10} {'Best Acc':<12} {'Time':<10} {'α mean':<10}")
-    print("-"*80)
-    for n, r in results.items():
-        print(f"{n:<10} {r['d_head']:<10} {r['acc']:5.1%}        {r['time']:<10.1f} {r['alpha_mean']:.3f}")
+    # AFTER training
+    print("\n--- AFTER TRAINING (200 epochs) ---")
+    stats_after, int_reals_after = get_stats(model, test_seq)
+    
+    print(f"\nComparison:")
+    print(f"  int_real range:  {stats_before['int_real_range']:.4f} → {stats_after['int_real_range']:.4f}")
+    print(f"  int_real std:    {stats_before['int_real_std']:.4f} → {stats_after['int_real_std']:.4f}")
+    print(f"  β (damping):     {stats_before['beta']:.4f} → {stats_after['beta']:.4f}")
+    print(f"  decay mean:      {stats_before['decay_mean']:.4f} → {stats_after['decay_mean']:.4f}")
+    
+    print(f"\nPer-timestep interference (before → after):")
+    for t in [0, 4, 5, 14, 15]:  # marker at 4, value at 5, query at 14, final at 15
+        print(f"  t={t:2d}: {int_reals_before[t]:7.4f} → {int_reals_after[t]:7.4f}")
 
 
 if __name__ == "__main__":
     test_gradient_flow()
-    test_alpha_dynamics()
-    # test_retrieval_task()
-    # test_comparison_heads()
+    test_interference_distribution()
+    test_learning_dynamics()

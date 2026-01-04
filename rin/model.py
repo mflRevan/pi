@@ -58,101 +58,125 @@ from .utils import wrap_time_periodic
 PHI = (1 + math.sqrt(5)) / 2  # ≈ 1.618033988749895
 
 
+def complex_to_real_drive(
+    x_real: torch.Tensor, 
+    x_imag: torch.Tensor,
+    amplitude: torch.Tensor,
+    angle: torch.Tensor,
+    t: torch.Tensor,
+    lut: 'SinLUT'
+) -> torch.Tensor:
+    """
+    Projects a Complex State (Re, Im) to a Scalar Drive (Real) with TIME-DEPENDENT measurement.
+    
+    CRITICAL FIX: The measurement basis must rotate with time to maintain gradient flow!
+    
+    Measurement weights are computed as:
+        A = exp(amplitude)  # Learnable scaling
+        total_angle = angle + t  # Time-evolving rotation
+        w_r = cos(total_angle)  # Real measurement weight
+        w_i = sin(total_angle)  # Imaginary measurement weight
+        drive = A * (x_real * w_r + x_imag * w_i)
+    
+    This creates a time-evolving measurement basis that preserves gradient flow
+    back through time, unlike static weights which block gradients.
+    
+    Args:
+        x_real: Real part of input (batch, features)
+        x_imag: Imaginary part of input (batch, features)
+        amplitude: Learnable amplitude scaling (features,) or broadcastable
+        angle: Learnable base angle (features,) or broadcastable
+        t: Time tensor for rotation (batch,) or scalar
+        lut: Sin/cos lookup table for fast computation
+        
+    Returns:
+        drive: Real-valued drive signals (batch, features)
+    """
+    # Compute time-dependent measurement basis
+    A = torch.exp(amplitude)  # Exponential amplitude scaling
+    
+    # Add time to angle (broadcast if needed)
+    if t.dim() == 1:
+        t_expanded = t.unsqueeze(-1)  # (batch, 1)
+    else:
+        t_expanded = t
+    total_angle = angle + t_expanded  # (batch, features)
+    
+    # Get measurement weights via Euler's formula
+    sin_angle, cos_angle = lut.lookup_sin_cos(total_angle)
+    w_r = cos_angle
+    w_i = sin_angle
+    
+    # Time-evolving quantum measurement
+    drive = A * (x_real * w_r + x_imag * w_i)
+    return drive
+
+
 class ComplexLinear(nn.Module):
     """
-    Complex-valued linear layer using proper complex multiplication.
+    Complex-valued linear transformation.
     
-    Models the weight as a complex matrix: W = W_real + i·W_imag
+    Implements: (x + iy) @ (W_real + i*W_imag)
     
-    Complex multiplication formula:
-        (a + bi)(c + di) = (ac - bd) + (ad + bc)i
-        
-    So for input (x_real, x_imag) and weight (W_real, W_imag):
-        out_real = W_real @ x_real - W_imag @ x_imag
-        out_imag = W_real @ x_imag + W_imag @ x_real
+    Using the complex multiplication rule:
+        Re(out) = Re(x) @ W_real - Im(x) @ W_imag
+        Im(out) = Re(x) @ W_imag + Im(x) @ W_real
+    
+    This is a proper complex linear transformation that mixes the complex stream
+    while preserving the complex structure and gradient flow.
     """
     
-    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+    def __init__(self, in_features: int, out_features: int):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
+        # Real and Imaginary components of the complex weight matrix
+        self.weight_real = nn.Parameter(torch.randn(out_features, in_features) * 0.02)
+        self.weight_imag = nn.Parameter(torch.randn(out_features, in_features) * 0.02)
         
-        # Real and imaginary parts of the complex weight matrix
-        self.W_real = nn.Linear(in_features, out_features, bias=False)
-        self.W_imag = nn.Linear(in_features, out_features, bias=False)
-        
-        # Optional bias (applied to both real and imag)
-        if bias:
-            self.bias_real = nn.Parameter(torch.zeros(out_features))
-            self.bias_imag = nn.Parameter(torch.zeros(out_features))
-        else:
-            self.register_parameter('bias_real', None)
-            self.register_parameter('bias_imag', None)
-        
-        self._init_weights()
-    
-    def _init_weights(self):
-        # Xavier-like initialization scaled for complex
-        nn.init.xavier_uniform_(self.W_real.weight, gain=0.5)
-        nn.init.xavier_uniform_(self.W_imag.weight, gain=0.5)
-    
-    def forward(
-        self, x_real: torch.Tensor, x_imag: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply complex linear transformation.
+    def forward(self, x_real: torch.Tensor, x_imag: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply complex linear transformation.
         
         Args:
-            x_real: Real part of input (batch, in_features)
-            x_imag: Imaginary part of input (batch, in_features)
+            x_real: Real part (batch, in_features)
+            x_imag: Imaginary part (batch, in_features)
             
         Returns:
-            out_real, out_imag: Complex output parts (batch, out_features)
+            out_real, out_imag: Complex output (batch, out_features) each
         """
-        # Complex multiplication: (W_r + iW_i)(x_r + ix_i)
-        # Real: W_r·x_r - W_i·x_i
-        out_real = self.W_real(x_real) - self.W_imag(x_imag)
-        # Imag: W_r·x_i + W_i·x_r
-        out_imag = self.W_real(x_imag) + self.W_imag(x_real)
-        
-        if self.bias_real is not None:
-            out_real = out_real + self.bias_real
-            out_imag = out_imag + self.bias_imag
+        # Complex multiplication: (x_real + i*x_imag) @ (W_real + i*W_imag)
+        out_real = F.linear(x_real, self.weight_real) - F.linear(x_imag, self.weight_imag)
+        out_imag = F.linear(x_real, self.weight_imag) + F.linear(x_imag, self.weight_real)
         
         return out_real, out_imag
 
 
 class ResonantLayer(nn.Module):
     """
-    True resonant layer with per-neuron, per-dimension wavelength and phase.
+    Pure resonant layer with NO dense projections.
     
-    Like an MLP, but instead of weighted sums, we do INTERFERENCE analysis.
-    
-    Each neuron has its own:
-        - W: (d_model,) wavelengths - one per input dimension
-        - B: (d_model,) phase offsets - one per input dimension
-    
-    Giving full parameter matrices: W, B both (num_neurons, d_model)
+    Takes complex input (d_model,) and expands to (num_neurons,) via wave interference.
+    This is an UP-PROJECTION through resonance, not matrix multiplication.
     
     Flow:
-        1. Input collapse: [x_real || x_imag] → Linear → x_collapsed (batch, d_model)
+        1. Complex measurement: (x_real, x_imag) → drive (real scalars)
+           Uses ComplexToRealDrive for element-wise measurement
         
         2. Per neuron, per dimension phase:
-           θ[n,d] = x_collapsed[d] / (1 + |W[n,d]|) + B[n,d] + t
+           θ[n,d] = drive[d] / (1 + |W[n,d]|) + B[n,d] + t
            → theta: (batch, num_neurons, d_model)
         
         3. Euler decomposition:
            sin(θ), cos(θ) → (batch, num_neurons, d_model) each
         
         4. INTERFERENCE SUM across d_model (the key operation!):
-           cos_sum = Σ_d cos(θ[n,d])  → (batch, num_neurons) scalar per neuron
-           sin_sum = Σ_d sin(θ[n,d])  → (batch, num_neurons) scalar per neuron
+           cos_sum = Σ_d cos(θ[n,d])  → (batch, num_neurons)
+           sin_sum = Σ_d sin(θ[n,d])  → (batch, num_neurons)
            
-           This is like a dot product but summing wave interference instead of
-           weighted values. Constructive interference → large magnitude.
-           Destructive interference → values cancel out.
-        
-        5. Project back: Linear(num_neurons, d_model) for real and imag separately
+        5. Return raw neuron outputs (NO projection):
+           Output is (cos_sum, sin_sum) as complex representation
+           Shape: (batch, num_neurons) each
+    
+    This makes the layer a pure resonant expansion.
+    For down-projection, use another ResonantLayer with num_neurons=d_model.
     """
     
     def __init__(
@@ -160,7 +184,7 @@ class ResonantLayer(nn.Module):
         d_model: int,
         num_neurons: int,
         lut_resolution: int = 4096,
-        use_swish: bool = True,
+        use_swish: bool = False,
         wrap_time: bool = False,
     ):
         super().__init__()
@@ -169,34 +193,23 @@ class ResonantLayer(nn.Module):
         self.use_swish = use_swish
         self.wrap_time = wrap_time
         
-        # Input collapse: complex plane → single vector for phase computation
-        self.input_collapse = nn.Linear(2 * d_model, d_model, bias=True)
+        # Measurement parameters: amplitude and angle (time-evolving basis)
+        self.measure_amplitude = nn.Parameter(nn.init.uniform_(torch.empty(d_model), -3.0, 3.0))
+        self.measure_angle = nn.Parameter(nn.init.uniform_(torch.empty(d_model), -math.pi, math.pi))
         
         # Per-neuron, per-dimension parameters (like MLP weights, but for resonance)
         # Each neuron has d_model wavelengths and d_model phase offsets
-        self.W = nn.Parameter(torch.randn(num_neurons, d_model) * 0.02)  # wavelength
-        self.B = nn.Parameter(torch.zeros(num_neurons, d_model))  # phase offset
+        self.W = nn.Parameter(nn.init.normal_(torch.empty(num_neurons, d_model), mean=0.0, std=0.05))  # wavelength
+        self.B = nn.Parameter(nn.init.uniform_(torch.empty(num_neurons, d_model), -math.pi, math.pi))  # phase offset
         
         # ATTENUATION: Learnable weights for interference sum
         # Each neuron learns which frequencies to listen to
         # Shape: (num_neurons, d_model) - weight per frequency per neuron
-        self.attn_cos = nn.Parameter(torch.ones(num_neurons, d_model))
-        self.attn_sin = nn.Parameter(torch.ones(num_neurons, d_model))
-        
-        # Output projections: interference scalars → d_model
-        self.out_proj_real = nn.Linear(num_neurons, d_model, bias=False)
-        self.out_proj_imag = nn.Linear(num_neurons, d_model, bias=False)
+        self.attn_cos = nn.Parameter(nn.init.uniform_(torch.empty(num_neurons, d_model), -1.0, 1.0))
+        self.attn_sin = nn.Parameter(nn.init.uniform_(torch.empty(num_neurons, d_model), -1.0, 1.0))
         
         self.lut_resolution = lut_resolution
         self._lut = None
-        
-        self._init_weights()
-    
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.input_collapse.weight, gain=0.5)
-        nn.init.zeros_(self.input_collapse.bias)
-        nn.init.xavier_uniform_(self.out_proj_real.weight, gain=0.5)
-        nn.init.xavier_uniform_(self.out_proj_imag.weight, gain=0.5)
     
     def _get_lut(self, device):
         if self._lut is None or self._lut.sin_table.device != device:
@@ -213,21 +226,23 @@ class ResonantLayer(nn.Module):
             t: Timestep tensor (batch,) or scalar, already scaled by φ
             
         Returns:
-            out_real, out_imag: Complex output (batch, d_model) each
+            out_real, out_imag: Complex output (batch, num_neurons) each
+                               Raw neuron activations, NO projection
         """
         lut = self._get_lut(x_real.device)
         
-        # 1. Collapse complex plane into single phase input
-        x_combined = torch.cat([x_real, x_imag], dim=-1)  # (batch, 2*d_model)
-        x_collapsed = self.input_collapse(x_combined)  # (batch, d_model)
+        # 1. Complex measurement: (x_real, x_imag) → real drive values with time-dependent basis
+        drive = complex_to_real_drive(x_real, x_imag, self.measure_amplitude, self.measure_angle, t, lut)  # (batch, d_model)
         
         # 2. Compute phase per neuron, per input dimension
-        # x_collapsed: (batch, d_model) → expand to (batch, 1, d_model)
+        # drive: (batch, d_model) → expand to (batch, 1, d_model)
         # W, B: (num_neurons, d_model)
         # Result: theta (batch, num_neurons, d_model)
         
-        x_expanded = x_collapsed.unsqueeze(1)  # (batch, 1, d_model)
-        wavelength = 1.0 + self.W.abs()  # (num_neurons, d_model)
+        drive_expanded = drive.unsqueeze(1)  # (batch, 1, d_model)
+        # Wavelength with gradient-preserving formulation
+        # Use 1 / (1 + |W|) to avoid gradient issues at W=0
+        wavelength = 1.0 / (1.0 + self.W.abs())  # (num_neurons, d_model)
         
         # Handle time dimension
         if t.dim() == 1:
@@ -239,29 +254,109 @@ class ResonantLayer(nn.Module):
         if self.wrap_time:
             t = wrap_time_periodic(t)
         
-        # θ[b,n,d] = x[b,d] / wavelength[n,d] + B[n,d] + t
-        theta = x_expanded / wavelength + self.B + t  # (batch, num_neurons, d_model)
+        # θ[b,n,d] = drive[b,d] / wavelength[n,d] + B[n,d] + t
+        theta = drive_expanded * wavelength + self.B + PHI * self.W.abs()  # (batch, num_neurons, d_model)
         
         # 3. Euler decomposition for each theta value
         sin_theta, cos_theta = lut.lookup_sin_cos(theta)  # (batch, num_neurons, d_model) each
         
         # 4. ATTENUATED INTERFERENCE SUM: Weighted sum across d_model dimension
         # Each neuron learns which frequencies to listen to via attn_cos/attn_sin
-        # This allows neurons to selectively tune into specific frequency bands
         cos_weighted = cos_theta * self.attn_cos  # (batch, num_neurons, d_model)
         sin_weighted = sin_theta * self.attn_sin  # (batch, num_neurons, d_model)
         
-        cos_sum = cos_weighted.sum(dim=-1)  # (batch, num_neurons)
-        sin_sum = sin_weighted.sum(dim=-1)  # (batch, num_neurons)
+        # The Energy Conservation Constant
+        # If d_model=32, this is ~0.177
+        energy_scale = 1.0 / math.sqrt(self.d_model)
         
-        # 5. Project interference scalars back to d_model
-        out_real = self.out_proj_real(cos_sum)  # (batch, d_model)
-        out_imag = self.out_proj_imag(sin_sum)  # (batch, d_model)
+        cos_sum = cos_weighted.sum(dim=-1) * energy_scale  # (batch, num_neurons)
+        sin_sum = sin_weighted.sum(dim=-1) * energy_scale  # (batch, num_neurons)
         
-        # Optional activation
+        # 5. Return raw neuron outputs - NO PROJECTION!
+        # Optional activation on the raw values
         if self.use_swish:
-            out_real = F.silu(out_real)
-            out_imag = F.silu(out_imag)
+            cos_sum = F.silu(cos_sum)
+            sin_sum = F.silu(sin_sum)
+        
+        return cos_sum, sin_sum
+
+
+class ResonantBlock(nn.Module):
+    """
+    Combined Echo Chamber + Resonant Layer block.
+    
+    Processes input through two parallel pathways:
+    1. Echo Chamber: Long-term memory via Q-EMA (constant-Q decay)
+    2. Resonant Layer: Wave interference analysis
+    
+    Outputs are summed (additive interference):
+        out = echo_out + resonant_out
+    
+    This allows the network to combine:
+    - Memory-based pattern matching (Echo Chamber)
+    - Frequency-based interference analysis (Resonant Layer)
+    
+    Args:
+        d_model: Model dimension
+        num_neurons: Number of resonant neurons
+        n_echo_heads: Number of echo heads (default: 4)
+        detach_memory: Whether to detach echo memory between steps
+                       False = full BPTT (recommended for learning)
+        echo_scale: Learnable scaling factor for echo contribution (default: 0.1)
+        use_swish: Apply SiLU activation to resonant output (default: True)
+    """
+    
+    def __init__(
+        self,
+        d_model: int,
+        num_neurons: int,
+        n_echo_heads: int = 4,
+        detach_memory: bool = False,
+        echo_scale: float = 0.1,
+        use_swish: bool = False,
+    ):
+        super().__init__()
+        from .echo_chamber import EchoChamber
+        
+        self.d_model = d_model
+        self.num_neurons = num_neurons
+        
+        # Two parallel pathways
+        self.echo_chamber = EchoChamber(d_model, n_echo_heads, detach_memory)
+        # Resonant path: d_model -> num_neurons -> d_model (up/down)
+        self.resonant_up = ResonantLayer(d_model, num_neurons, use_swish=use_swish)
+        self.resonant_down = ResonantLayer(num_neurons, d_model, use_swish=use_swish)
+        
+        # Learnable scaling for echo contribution
+        self.echo_scale = nn.Parameter(torch.tensor(echo_scale))
+    
+    def reset_memory(self, batch_size: int, device: torch.device):
+        """Reset echo chamber memory."""
+        self.echo_chamber.reset_memory(batch_size, device)
+    
+    def forward(
+        self, x_real: torch.Tensor, x_imag: torch.Tensor, t: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Process input through parallel Echo + Resonant pathways.
+        
+        Args:
+            x_real: Real part of input (batch, d_model)
+            x_imag: Imaginary part of input (batch, d_model)
+            t: Timestep tensor
+            
+        Returns:
+            out_real, out_imag: Combined output (batch, d_model) each
+        """
+        # Parallel computation
+        echo_real, echo_imag = self.echo_chamber(x_real, x_imag, t)
+        # Resonant: up then down projection
+        res_up_real, res_up_imag = self.resonant_up(x_real, x_imag, t)
+        res_real, res_imag = self.resonant_down(res_up_real, res_up_imag, t)
+        
+        # Additive interference with learnable echo scale
+        out_real = res_real + self.echo_scale * echo_real
+        out_imag = res_imag + self.echo_scale * echo_imag
         
         return out_real, out_imag
 
@@ -304,8 +399,8 @@ class RINModel(nn.Module):
         num_layers: int = 2,
         num_neurons: int = 256,
         lut_resolution: int = 4096,
-        use_swish: bool = True,
-        wrap_time: bool = False,
+        use_swish: bool = False,
+        wrap_time: bool = True,
     ):
         super().__init__()
         
@@ -317,28 +412,42 @@ class RINModel(nn.Module):
         self.use_swish = use_swish
         self.wrap_time = wrap_time
         
-        # Token embeddings: 2*d_model for (w, b) pairs
+        # Token embeddings: 4*d_model for (w, b, amplitude, angle) tuples
         # w = wavelength control, b = phase offset
-        self.token_embedding = nn.Embedding(vocab_size, 2 * d_model)
+        # amplitude, angle = measurement parameters for time-evolving basis
+        self.token_embedding = nn.Embedding(vocab_size, 4 * d_model)
         
-        # Resonant layers - now operate on complex signals
-        self.layers = nn.ModuleList([
-            ResonantLayer(d_model, num_neurons, lut_resolution, use_swish=use_swish, wrap_time=wrap_time)
-            for _ in range(num_layers)
-        ])
+        # Resonant layers with conditional down projection and ComplexLinear mixers
+        # Each layer: d_model -> num_neurons (up) -> ComplexLinear mixer -> [d_model (down)]
+        # Mixer operates at num_neurons dimension, between up and down projections
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            layer_dict = nn.ModuleDict()
+            
+            # Up-projection: d_model -> num_neurons via resonance
+            layer_dict['up'] = ResonantLayer(d_model, num_neurons, lut_resolution, use_swish=use_swish, wrap_time=wrap_time)
+            
+            # ComplexLinear mixer: mixes the complex stream at num_neurons dimension
+            # Operates BETWEEN up and down projections
+            layer_dict['mixer'] = ComplexLinear(num_neurons, num_neurons)
+            
+            # Conditional down-projection: only if num_neurons != d_model
+            if num_neurons != d_model:
+                layer_dict['down'] = ResonantLayer(num_neurons, d_model, lut_resolution, use_swish=use_swish, wrap_time=wrap_time)
+            
+            self.layers.append(layer_dict)
         
-        # Output projection: collapses complex signal to real logits
-        # Uses ComplexLinear to properly combine real and imag parts
-        self.output_proj_complex = ComplexLinear(d_model, vocab_size, bias=False)
+        # Output projection: 2*d_model (concatenated complex state) -> vocab_size
+        # Pure linear projection treating complex information as single input vector
+        self.output_layer = nn.Linear(2 * d_model, vocab_size)
         
         self._lut = None
         self._init_weights()
     
     def _init_weights(self):
-        nn.init.normal_(self.token_embedding.weight, std=0.02)
-        # Scale down for stable initial transformations
-        with torch.no_grad():
-            self.token_embedding.weight.mul_(0.5)
+        # Increase embedding scale for better initial signal propagation
+        nn.init.normal_(self.token_embedding.weight, std=0.1)
+        # Don't scale down - we need strong initial signals
     
     def _get_lut(self, device):
         if self._lut is None or self._lut.sin_table.device != device:
@@ -360,59 +469,55 @@ class RINModel(nn.Module):
         h_imag: torch.Tensor,
         w: torch.Tensor,
         b: torch.Tensor,
+        amplitude: torch.Tensor,
+        angle: torch.Tensor,
         t: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply Euler-based hidden state transformation with proper complex propagation.
+        Apply Euler-based hidden state transformation using time-evolving measurement.
         
-        CRITICAL FIX: We compute SEPARATE thetas for real and imaginary components,
-        then combine via proper complex multiplication. This preserves phase information
-        and distinguishes constructive from destructive interference.
+        TIME-DEPENDENT PARADIGM: Measurement basis rotates with time!
         
-        θ_real = h_real / (1 + |w|) + b + t·φ
-        θ_imag = h_imag / (1 + |w|) + b + t·φ
+        Flow:
+        1. Measure: drive = exp(amplitude) * (h_real * cos(angle+t) + h_imag * sin(angle+t))
+        2. Compute phase: θ = drive / (1 + |w|) + b + t·φ
+        3. Euler rotation: h_new = cos(θ) + i·sin(θ)
         
-        Then combine via complex multiplication of unit phasors:
-        e^(iθ_real) x e^(iθ_imag) = e^(i(θ_real + θ_imag))
-        
-        But computed through separate gradient paths:
-        h_real_new = cos(θ_real)·cos(θ_imag) - sin(θ_real)·sin(θ_imag)
-        h_imag_new = cos(θ_real)·sin(θ_imag) + sin(θ_real)·cos(θ_imag)
-        
-        This is proper complex multiplication: e^(iθ_r) x e^(iθ_i) = e^(i(θ_r + θ_i))
-        But computed through separate gradient paths to preserve information.
-        
-        The wavelength (1 + |w|) controls oscillation speed:
-        - Larger |w| = slower rotation = more stable patterns
+        This uses the same time-evolving measurement as ResonantLayer!
         
         Args:
-            t: Timestep tensor (batch,) or scalar tensor
+            h_real: Real part of hidden state (batch, d_model)
+            h_imag: Imaginary part of hidden state (batch, d_model)
+            w: Wavelength control (batch, d_model)
+            b: Phase offset (batch, d_model)
+            amplitude: Measurement amplitude parameter (batch, d_model)
+            angle: Measurement base angle (batch, d_model)
+            t: Timestep tensor (batch,) or scalar
+            
+        Returns:
+            h_real_new, h_imag_new: Updated hidden state
         """
         lut = self._get_lut(h_real.device)
         
-        # Phase formula with SEPARATE thetas - no information collapse!
-        wavelength = 1.0 + w.abs()
+        # 1. Complex-to-real measurement with time-evolving basis
+        drive = complex_to_real_drive(h_real, h_imag, amplitude, angle, t, lut)  # (batch, d_model)
+        
+        # 2. Compute phase with gradient-preserving wavelength
+        wavelength = 1.0 / (1.0 + w.abs())
         t_phi = t.unsqueeze(-1) * PHI if t.dim() == 1 else t * PHI
         
-        # Wrap time to [0, 2π) if enabled (detached modulo for gradient flow)
+        # Wrap time if enabled
         if self.wrap_time:
             t_phi = wrap_time_periodic(t_phi)
         
-        # Separate theta computation preserves real/imag distinction
-        theta_real = h_real / wavelength + b + t_phi
-        theta_imag = h_imag / wavelength + b + t_phi
+        # Single theta from measured drive
+        theta = drive * wavelength + b + PHI * w.abs()  # (batch, d_model)
         
-        # Euler decomposition for each component
-        sin_real, cos_real = lut.lookup_sin_cos(theta_real)
-        sin_imag, cos_imag = lut.lookup_sin_cos(theta_imag)
+        # 3. Euler rotation: e^(iθ) = cos(θ) + i·sin(θ)
+        sin_theta, cos_theta = lut.lookup_sin_cos(theta)
         
-        # Complex multiplication: (cos_r + i·sin_r) x (cos_i + i·sin_i)
-        # = (cos_r·cos_i - sin_r·sin_i) + i(cos_r·sin_i + sin_r·cos_i)
-        # This preserves BOTH gradient paths through h_real and h_imag
-        h_real_new = cos_real * cos_imag - sin_real * sin_imag
-        h_imag_new = cos_real * sin_imag + sin_real * cos_imag
-        
-        return h_real_new, h_imag_new
+        # Return as complex pair
+        return cos_theta, sin_theta
     
     def forward(
         self,
@@ -443,46 +548,57 @@ class RINModel(nn.Module):
         else:
             h_real, h_imag = hidden
         
-        # Get all embeddings at once
+        # Get all embeddings at once (4*d_model = w, b, amplitude, angle)
         embeddings = self.token_embedding(input_ids)
-        w_emb = embeddings[:, :, :self.d_model]
-        b_emb = embeddings[:, :, self.d_model:]
+        w_emb = embeddings[:, :, :self.d_model]                    # wavelength
+        b_emb = embeddings[:, :, self.d_model:2*self.d_model]      # bias
+        amp_emb = embeddings[:, :, 2*self.d_model:3*self.d_model]  # measure_amplitude
+        ang_emb = embeddings[:, :, 3*self.d_model:]                # measure_angle
         
         # Pre-compute timestep tensors to avoid recompilation
         t_indices = torch.arange(seq_len, device=device, dtype=torch.float32) + t_start
         
-        all_logits = []
+        # Pre-allocate output tensor (faster than list append + stack)
+        all_logits = torch.empty(batch_size, seq_len, self.vocab_size, device=device)
         
         for t in range(seq_len):
-            w_t = w_emb[:, t, :]
-            b_t = b_emb[:, t, :]
+            # Slice operations are faster than indexing
+            w_t = w_emb[:, t]
+            b_t = b_emb[:, t]
+            amp_t = amp_emb[:, t]
+            ang_t = ang_emb[:, t]
             t_val = t_indices[t].expand(batch_size)
             
-            # Euler-based hidden state transformation
+            # Euler-based hidden state transformation with time-evolving measurement
             # Output is complex: (h_real, h_imag)
-            h_real, h_imag = self.euler_transform(h_real, h_imag, w_t, b_t, t_val)
+            h_real, h_imag = self.euler_transform(h_real, h_imag, w_t, b_t, amp_t, ang_t, t_val)
             
-            # Process through resonant layers with residual connections
+            # Process through resonant layers - NO residuals!
             # CRITICAL: Keep signal complex throughout!
+            # The complex pairs ARE the gradient highway
             x_real, x_imag = h_real, h_imag
             t_phi = t_val * PHI
             
-            for layer in self.layers:
-                # Layer outputs complex (delta_real, delta_imag)
-                delta_real, delta_imag = layer(x_real, x_imag, t_phi)
-                # Residual connection in complex space
-                x_real = x_real + delta_real
-                x_imag = x_imag + delta_imag
+            for layer_dict in self.layers:
+                # Up-projection: d_model -> num_neurons via resonance
+                up_real, up_imag = layer_dict['up'](x_real, x_imag, t_phi)
+                
+                # ComplexLinear mixer: mix the complex stream at num_neurons dimension
+                mixed_real, mixed_imag = layer_dict['mixer'](up_real, up_imag)
+                
+                # Conditional down-projection: num_neurons -> d_model (only if needed)
+                if 'down' in layer_dict:
+                    x_real, x_imag = layer_dict['down'](mixed_real, mixed_imag, t_phi)
+                else:
+                    # No down projection needed (num_neurons == d_model)
+                    x_real, x_imag = mixed_real, mixed_imag
             
-            # Final collapse: complex -> real logits
-            # Use complex projection then sum components
-            logits_real, logits_imag = self.output_proj_complex(x_real, x_imag)
-            # Collapse to real: this is the ONLY place we sum real + imag
-            logits = logits_real + logits_imag
-            
-            all_logits.append(logits)
+            # Final output: concatenate complex state and project to vocab_size
+            # Treat (x_real, x_imag) as single 2*d_model dimensional vector
+            x_combined = torch.cat([x_real, x_imag], dim=-1)  # (batch, 2*d_model)
+            all_logits[:, t] = self.output_layer(x_combined)  # Direct assignment
         
-        return torch.stack(all_logits, dim=1), (h_real, h_imag)
+        return all_logits, (h_real, h_imag)
     
     def compute_loss(
         self,
@@ -516,13 +632,20 @@ class RINModel(nn.Module):
         x_real, x_imag = h_real, h_imag
         t_phi = t_val * PHI
         
-        for layer in self.layers:
-            delta_real, delta_imag = layer(x_real, x_imag, t_phi)
-            x_real = x_real + delta_real
-            x_imag = x_imag + delta_imag
+        for layer_dict in self.layers:
+            up_real, up_imag = layer_dict['up'](x_real, x_imag, t_phi)
+            
+            # ComplexLinear mixer at num_neurons dimension
+            mixed_real, mixed_imag = layer_dict['mixer'](up_real, up_imag)
+            
+            # Conditional down-projection
+            if 'down' in layer_dict:
+                x_real, x_imag = layer_dict['down'](mixed_real, mixed_imag, t_phi)
+            else:
+                x_real, x_imag = mixed_real, mixed_imag
         
-        logits_real, logits_imag = self.output_proj_complex(x_real, x_imag)
-        return logits_real + logits_imag
+        x_combined = torch.cat([x_real, x_imag], dim=-1)
+        return self.output_layer(x_combined)
     
     @torch.no_grad()
     def generate(
@@ -543,13 +666,15 @@ class RINModel(nn.Module):
         # Process prompt
         embeddings = self.token_embedding(input_ids)
         w_emb = embeddings[:, :, :self.d_model]
-        b_emb = embeddings[:, :, self.d_model:]
+        b_emb = embeddings[:, :, self.d_model:2*self.d_model]
+        amp_emb = embeddings[:, :, 2*self.d_model:3*self.d_model]
+        ang_emb = embeddings[:, :, 3*self.d_model:]
         
         t = 0
         for i in range(input_ids.shape[1]):
             t_tensor = torch.tensor([t], device=device, dtype=torch.float32).expand(batch_size)
             h_real, h_imag = self.euler_transform(
-                h_real, h_imag, w_emb[:, i, :], b_emb[:, i, :], t_tensor
+                h_real, h_imag, w_emb[:, i, :], b_emb[:, i, :], amp_emb[:, i, :], ang_emb[:, i, :], t_tensor
             )
             t += 1
         
@@ -574,9 +699,11 @@ class RINModel(nn.Module):
             # Update hidden state
             emb = self.token_embedding(next_token.squeeze(-1))
             w_t = emb[:, :self.d_model]
-            b_t = emb[:, self.d_model:]
+            b_t = emb[:, self.d_model:2*self.d_model]
+            amp_t = emb[:, 2*self.d_model:3*self.d_model]
+            ang_t = emb[:, 3*self.d_model:]
             t_tensor = torch.tensor([t], device=device, dtype=torch.float32).expand(batch_size)
-            h_real, h_imag = self.euler_transform(h_real, h_imag, w_t, b_t, t_tensor)
+            h_real, h_imag = self.euler_transform(h_real, h_imag, w_t, b_t, amp_t, ang_t, t_tensor)
             
             # Get logits (complex throughout, collapse at end)
             logits = self._compute_single_step(h_real, h_imag, t_tensor)
