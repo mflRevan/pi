@@ -1,0 +1,5 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/home/aiman/pi/.venv/bin/python": true
+    }
+}

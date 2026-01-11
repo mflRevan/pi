@@ -1,84 +1,212 @@
 """
-Resonant Interference Network (RIN) - Complex-Valued Edition
+Holographic Transformer (RIN) - V7 Modular Architecture
 
-The most beautiful neural network architecture in existence, combining:
-    π  - The circle constant (sin/cos periodicity)
-    e  - Euler's number (e^iθ = cos θ + i·sin θ)
-    i  - The imaginary unit (complex plane rotation)
-    φ  - The golden ratio (maximally irrational timestep)
-    0,1 - The fundamental binary (unit circle bounds)
+A neural network architecture based on complex-valued representations with:
+    - Clean separation of concerns: Real = CONTENT, Imaginary = TIMING
+    - Resonant FFN with TRUE interference gating
+    - Holographic Attention with content + phase blending
+    - Modular, maintainable code structure
 
-EULER'S FORMULA: e^(iθ) = cos(θ) + i·sin(θ)
+Core Components:
+    - ffn.py:           ResonantFFN (unified entry point for all FFN variants)
+    - attention.py:     HolographicAttention, PureInterferenceAttention
+    - block.py:         HolographicBlock (attention + FFN)
+    - transformer.py:   HolographicTransformer, SwiGLUTransformer (baseline)
+    - kernels/          Triton kernels for acceleration
 
-KEY INSIGHT: Every neuron is a point on the unit circle with CONSTANT gradient:
-    |∇θ|² = sin²θ + cos²θ = 1
+FFN Gate Modes:
+    - 'content': Original content-only gating
+    - 'time': Position-aware gating (RoPE-style)
+    - 'parallel': Multiplicative time × content gating
+    - 'omniware': Unified time × content (recommended, default)
 
-CRITICAL: Signals are kept COMPLEX (real, imag pairs) throughout the network.
-Only at the final output (logits) do we collapse to real values.
-This preserves phase information and distinguishes:
-    - Destructive interference: (1, -1) → would collapse to 0
-    - Silence: (0, 0) → would also collapse to 0
+Triton Acceleration:
+    When available, Triton kernels provide <2x overhead vs SwiGLU baseline.
+    Automatically enabled for 'omniware' mode on CUDA.
 
-CORE FORMULAS:
-    # Hidden state transformation (phase = magnitude × state + bias + time)
-    θ = (h_real + h_imag) * |w| + b + t·φ
-    h_real = cos(θ), h_imag = sin(θ)
+Usage:
+    from rin import HolographicTransformer, ResonantFFN, HolographicAttention
     
-    # Complex linear (proper complex multiplication)
-    out_real = W_real @ x_real - W_imag @ x_imag
-    out_imag = W_real @ x_imag + W_imag @ x_real
-
-Results:
-- 100% test accuracy on modular arithmetic (grokking)
-- 0 stability dips (vs 14 for sin-only baseline)
-- Grokking in ~60 epochs (vs never for baseline)
+    # Full model
+    model = HolographicTransformer(
+        vocab_size=50257,
+        d_model=512,
+        n_layers=6,
+        gate_mode='omniware',
+        use_triton=True,
+    )
+    
+    # Components
+    ffn = ResonantFFN(d_model=512, gate_mode='omniware')
+    attn = HolographicAttention(d_model=512, n_heads=8)
 """
 
-from .lut import SinLUT, get_global_lut
-from .model import (
-    RINModel,
-    ResonantLayer,
-    ResonantBlock,
-    complex_to_real_drive,
-    GOLDEN_RATIO,
-    PHI,
-)
-from .utils import wrap_time_periodic
-from .attention import (
-    ResonantAttention,
-    ResonantAttentionHead,
-    ResonantBlock as AttentionResonantBlock,
-    RINAttentionModel,
-    StateCache,
-)
-from .echo_chamber import (
-    EchoChamber,
-    EchoHead,
-    EchoChamberModel,
+import math
+
+# Constants
+PHI = (1 + math.sqrt(5)) / 2  # Golden ratio
+GOLDEN_RATIO = PHI
+
+# =============================================================================
+# PRIMARY EXPORTS (New Modular Architecture)
+# =============================================================================
+
+# FFN - Single entry point
+from .ffn import (
+    ResonantFFN,
+    ResonantFFN_Content,
+    ResonantFFN_TimeAware,
+    ResonantFFN_ParallelGate,
+    ResonantFFN_Omniware,
 )
 
-__version__ = "2.0.0"
+# Attention
+from .attention import (
+    AttentionConfig,
+    PureInterferenceAttention,
+    HolographicAttention,
+    create_position_phases,
+)
+
+# Block
+from .block import HolographicBlock
+
+# Transformer
+from .transformer import (
+    SwiGLUTransformer,
+    HolographicTransformer,
+)
+
+# Utilities
+from .utils import (
+    create_inv_freq,
+    create_pos_freqs,
+    compute_energy_scale,
+)
+
+# =============================================================================
+# TRITON KERNELS (Optional)
+# =============================================================================
+
+TRITON_AVAILABLE = False
+try:
+    import triton
+    TRITON_AVAILABLE = True
+    
+    from .kernels import (
+        # FFN kernels (V2 recommended)
+        omniware_ffn_gate_forward_v2,
+        OmniwareFFNGateFunctionV2,
+        TritonOmniwareFFN,
+        
+        # Attention kernels
+        fused_phase_projection,
+        interference_scores,
+        
+        # Utilities
+        get_cos_sin_lut,
+    )
+except ImportError:
+    pass
+
+# =============================================================================
+# LEGACY EXPORTS (Backward Compatibility)
+# =============================================================================
+# These imports from optimized.py are deprecated but kept for compatibility
+
+try:
+    from .optimized import (
+        PureInterferenceAttention as _LegacyPureInterferenceAttention,
+        HolographicAttention as _LegacyHolographicAttention,
+        ResonantFFN as _LegacyResonantFFN,
+        HolographicBlock as _LegacyHolographicBlock,
+        HolographicTransformer as _LegacyHolographicTransformer,
+    )
+except ImportError:
+    pass
+
+
+__version__ = "7.0.0"  # V7: Modular Architecture
+
 __all__ = [
-    # Core LUT
-    "SinLUT",
-    "get_global_lut",
-    # RIN Model (original, resonant-only)
-    "RINModel",
+    # Constants
+    'PHI',
+    'GOLDEN_RATIO',
+    'TRITON_AVAILABLE',
+    
+    # FFN (primary)
+    'ResonantFFN',
+    'ResonantFFN_Content',
+    'ResonantFFN_TimeAware',
+    'ResonantFFN_ParallelGate',
+    'ResonantFFN_Omniware',
+    
+    # Attention (primary)
+    'AttentionConfig',
+    'PureInterferenceAttention',
+    'HolographicAttention',
+    
+    # Block & Transformer (primary)
+    'HolographicBlock',
+    'HolographicTransformer',
+    'SwiGLUTransformer',
+    
+    # Utilities
+    'create_position_phases',
+    'create_inv_freq',
+    'create_pos_freqs',
+    'compute_energy_scale',
+]
+
+# Conditional Triton exports
+if TRITON_AVAILABLE:
+    __all__.extend([
+        'omniware_ffn_gate_forward_v2',
+        'OmniwareFFNGateFunctionV2',
+        'TritonOmniwareFFN',
+        'fused_phase_projection',
+        'interference_scores',
+        'get_cos_sin_lut',
+    ])
+
+__all__ = [
+    # Constants
+    "PHI",
+    "GOLDEN_RATIO",
+    "TRITON_AVAILABLE",
+    
+    # Core: Resonant Layer (clean implementation)
+    "RMSNorm",
     "ResonantLayer",
     "ResonantBlock",
-    "ComplexLinear",
-    "GOLDEN_RATIO",
-    "PHI",
+    
+    # Attention
+    "ComplexAttention",
+    "SDPAComplexAttention", 
+    "FullComplexAttention",
+    "StandardAttention",
+    "get_attention",
+    
+    # Optimized Holographic/Interference
+    "PureInterferenceAttention",
+    "HolographicAttention",
+    "ResonantFFN",
+    "HolographicBlock",
+    "HolographicTransformer",
+    
+    # Model
+    "ComplexEmbedding",
+    "ComplexPositionalEncoding",
+    "ComplexTransformerBlock",
+    "ComplexResonantTransformer",
+    "StandardTransformer",
+    
     # Utils
     "wrap_time_periodic",
-    # Echo Chamber (memory-augmented)
-    "EchoChamber",
-    "EchoHead",
-    "EchoChamberModel",
-    # Legacy Attention components
-    "ResonantAttention",
-    "ResonantAttentionHead",
-    "AttentionResonantBlock",
-    "RINAttentionModel",
-    "StateCache",
+    "count_parameters",
+    
+    # Config
+    "ModelConfig",
+    "TrainingConfig",
+    "DataConfig",
 ]

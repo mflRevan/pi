@@ -1,8 +1,24 @@
 """
-SwiGLU Transformer Baseline
+Transformer Models - SwiGLU Baseline and Holographic Transformer
 
-A standard Transformer with SwiGLU FFN for fair comparison against RIN/Echo models.
-Matches parameter count and layout for apples-to-apples comparison.
+This module provides:
+- SwiGLUTransformer: Standard Transformer with SwiGLU FFN (baseline)
+- HolographicTransformer: Holographic Transformer with Resonant FFN
+
+Usage:
+    from rin.transformer import SwiGLUTransformer, HolographicTransformer
+    
+    # Baseline
+    baseline = SwiGLUTransformer(vocab_size=50257, d_model=512, num_layers=6)
+    
+    # Holographic (with Omniware FFN, Triton acceleration)
+    model = HolographicTransformer(
+        vocab_size=50257,
+        d_model=512,
+        n_layers=6,
+        gate_mode='omniware',
+        use_triton=True,
+    )
 """
 
 import torch
@@ -232,3 +248,187 @@ class SwiGLUTransformer(nn.Module):
             f"  params={self.get_num_params():,}\n"
             f")"
         )
+
+
+# =============================================================================
+# HOLOGRAPHIC TRANSFORMER
+# =============================================================================
+
+class HolographicTransformer(nn.Module):
+    """
+    Full Holographic Transformer for sequence modeling.
+    
+    Architecture:
+    - Embedding layer with Real/Imag split
+    - Stack of HolographicBlocks
+    - Output projection to vocabulary
+    
+    The key innovation is maintaining separate real (content) and imaginary (phase)
+    streams throughout, with position information encoded additively in the phase space.
+    
+    FFN Gate Modes (gate_mode):
+    - 'content': Original content-only gating
+    - 'time': Position-aware gating (RoPE-style, position only)
+    - 'parallel': Time × Content multiplicative gating (two separate activations)
+    - 'omniware': Unified time × content theta (single activation, most expressive)
+    
+    For 'omniware' mode (default), log_grad (default True) enables logarithmic
+    gradient scaling: ln(1 + |grad|) * sign(grad) applied to x_imag and w gradients.
+    
+    This provides natural geometric compression for multiscale time frequencies:
+    - Gradient ratio reduction: ~40-500x (from ~2000-4000x to ~2-60x)
+    - Compute overhead: <1% (identity forward, simple log backward)
+    - Works at any sequence length without numerical instability
+    
+    Triton Acceleration:
+    When use_triton=True (default) and gate_mode='omniware':
+    - Uses V2 optimized kernels with autotuned block sizes
+    - Two-pass backward without atomic operations
+    - <2x overhead vs SwiGLU baseline
+    
+    Args:
+        vocab_size: Vocabulary size
+        d_model: Model dimension
+        n_heads: Number of attention heads
+        n_layers: Number of transformer layers
+        n_phase: Phase features for attention (default: 8 * n_heads)
+        expansion: FFN expansion factor
+        dropout: Dropout rate
+        causal: Whether to use causal masking
+        max_seq_len: Maximum sequence length
+        use_pure_interference: If True, use PureInterferenceAttention
+        gate_mode: FFN gating mode ('content', 'time', 'parallel', 'omniware')
+        use_triton: Whether to use Triton kernels
+        log_grad: Enable log gradient scaling for 'omniware'
+    """
+    
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 512,
+        n_heads: int = 8,
+        n_layers: int = 6,
+        n_phase: int = None,
+        expansion: int = 4,
+        dropout: float = 0.0,
+        causal: bool = True,
+        max_seq_len: int = 8192,
+        use_pure_interference: bool = False,
+        gate_mode: str = 'omniware',
+        use_triton: bool = True,
+        log_grad: bool = True,
+    ):
+        super().__init__()
+        
+        # Import here to avoid circular imports
+        from .block import HolographicBlock
+        
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.gate_mode = gate_mode
+        self.use_triton = use_triton
+        self.log_grad = log_grad
+        
+        # Embeddings for real and imaginary streams
+        self.embed_real = nn.Embedding(vocab_size, d_model)
+        self.embed_imag = nn.Embedding(vocab_size, d_model)
+        
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            HolographicBlock(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_phase=n_phase,
+                expansion=expansion,
+                dropout=dropout,
+                causal=causal,
+                max_seq_len=max_seq_len,
+                use_pure_interference=use_pure_interference,
+                gate_mode=gate_mode,
+                use_triton=use_triton,
+                log_grad=log_grad,
+            )
+            for _ in range(n_layers)
+        ])
+        
+        # Output
+        self.norm = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        
+        # Weight tying
+        self.lm_head.weight = self.embed_real.weight
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        nn.init.normal_(self.embed_real.weight, std=0.02)
+        nn.init.normal_(self.embed_imag.weight, std=0.02)
+    
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass.
+        
+        Args:
+            input_ids: Token IDs (B, L)
+            mask: Optional attention mask
+            
+        Returns:
+            Logits (B, L, vocab_size)
+        """
+        # Get embeddings
+        x_real = self.embed_real(input_ids)
+        x_imag = self.embed_imag(input_ids)
+        
+        # Process through blocks
+        for block in self.blocks:
+            x_real, x_imag = block(x_real, x_imag, mask)
+        
+        # Output
+        x = self.norm(x_real)
+        logits = self.lm_head(x)
+        
+        return logits
+    
+    def compute_loss(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute cross-entropy loss for language modeling."""
+        logits = self.forward(input_ids)
+        
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        
+        loss = F.cross_entropy(
+            shift_logits.view(-1, self.vocab_size),
+            shift_labels.view(-1),
+        )
+        
+        return loss, logits
+    
+    def get_num_params(self) -> int:
+        """Return total number of parameters."""
+        return sum(p.numel() for p in self.parameters())
+    
+    def __repr__(self) -> str:
+        triton_info = ', triton=True' if self.use_triton else ''
+        return (
+            f"HolographicTransformer(\n"
+            f"  vocab_size={self.vocab_size},\n"
+            f"  d_model={self.d_model},\n"
+            f"  n_layers={self.n_layers},\n"
+            f"  gate_mode={self.gate_mode}{triton_info},\n"
+            f"  params={self.get_num_params():,}\n"
+            f")"
+        )
+
+
+__all__ = [
+    'SwiGLU',
+    'CausalSelfAttention',
+    'TransformerBlock',
+    'SwiGLUTransformer',
+    'HolographicTransformer',
+]

@@ -3,6 +3,7 @@
 __pycache__
 checkpoints
 results
+ablation_results
 data
 
 # specific files
