@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 WikiText-2 Language Modeling Ablation Study
 ============================================
