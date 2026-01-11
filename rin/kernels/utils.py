@@ -5,6 +5,14 @@ Kernel Utilities - LUT, common helpers
 import torch
 import math
 
+# Check Triton availability
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+
 
 # =============================================================================
 # COSINE LUT SETUP
